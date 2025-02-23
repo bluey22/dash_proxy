@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+# grapher.py
 import matplotlib.pyplot as plt
 
 def main():
