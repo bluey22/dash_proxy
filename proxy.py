@@ -1,12 +1,10 @@
 # proxy.py
 import errno
-import json
 import socket
 import select
-import uuid
 import logging
 from collections import deque
-from typing import Dict, Set, Optional, List
+from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
 import xml.etree.ElementTree as ET  # Manifest XML Parsing
@@ -177,7 +175,9 @@ class ProxyServer:
 
             # Check 1: Does our current HTTP message have complete headers?
             if not conn.headers_complete:
-                if not self._process_headers(conn):  # If not, process them and check again
+
+                 # If not, process them and check again (Which we asserted was not empty => _process_headers accesses conn.input_buffer)
+                if not self._process_headers(conn): 
                     break  # We need to wait for more data to complete our message
             
             if conn.current_message:  # If headers are complete, and we're currently still building an HTTP message
@@ -185,7 +185,7 @@ class ProxyServer:
                 
                 if remaining > 0:
                     # Find these bytes from the remaining input_buffer
-                    body_data = conn.input_buffer[:remaining]
+                    body_data = conn.input_buffer[:remaining]  # In python, no index error here, just returns max (interesting)
                     conn.current_message.body.extend(body_data)
                     conn.body_received += len(body_data)
 
@@ -201,6 +201,8 @@ class ProxyServer:
                     conn.body_received = 0
                     conn.headers_size = 0
                     conn.current_message = None
+
+                    # Run while loop again in case we have another message
                 else:
                     break
 
@@ -313,22 +315,20 @@ class ProxyServer:
             return None
 
     def _prepare_client_response(self, fd: int):
-        """Prepare next response for client"""
+        """Prepare next response for the client (from the backend)"""
         # Get the connection object
         conn = self.connections[fd]
         
         # Head of line blocking! We want to send the clients their responses based on the order they requested
-        if conn.pending_responses and conn.request_order:
+        while conn.pending_responses and conn.request_order and conn.request_order[0] in conn.pending_responses:
             next_backend_fd = conn.request_order[0]
 
-            while next_backend_fd in conn.pending_responses:
-                # We don't add to this dictionary unless the value exists, can safely grab it in resp
-                resp = conn.pending_responses[next_backend_fd]
-                conn.request_order.popleft()
-                conn.pending_responses.remove(next_backend_fd)  # remove by key
-                conn.output_buffer.extend(resp.build())
-                self.epoll.modify(fd, READ_WRITE)
-                next_backend_fd = conn.request_order[0]
+            # We don't add to this dictionary unless the value exists, can safely grab it in resp
+            resp = conn.pending_responses[next_backend_fd]
+            conn.request_order.popleft()
+            conn.pending_responses.remove(next_backend_fd)  # remove by key
+            conn.output_buffer.extend(resp.build())
+            self.epoll.modify(fd, READ_WRITE)
 
     def _handle_write(self, fd: int):
         """Handle write events"""
