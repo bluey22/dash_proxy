@@ -350,7 +350,8 @@ class ProxyServer:
                     else:
                         # Add the next response to this buffer (to the client_)
                         self._prepare_client_response(fd)
-                        
+
+                    # Check again due to side effects from _prepare_next or _prepare_client    
                     if not conn.output_buffer:
                         self.epoll.modify(fd, READ_ONLY)
                         
@@ -387,13 +388,12 @@ class ProxyServer:
             # Cleanup connection state
             if conn.is_backend:
                 addr = f"{conn.addr[0]}:{conn.addr[1]}"
-                if addr in self.backend_pool:
-                    self.backend_pool[addr].discard(fd)
+                # TODO
+                pass
             else:
                 # Cleanup any pending requests
-                for req_id in conn.request_order:
-                    if req_id in self.request_map:
-                        del self.request_map[req_id]
+                # TODO
+                pass
                         
             del self.connections[fd]  # Remove from active connections
 
