@@ -18,6 +18,14 @@ Part of our project entails graphing detailed activity, and we'll walk through t
 - Client side bandwidth estimation (when to request, what encoding rate, where to request => **we pull this into our proxy, rather than the browser/client doing it**)
 
 ## Project Setup
+Set up a virtual environment and install requirements
+```bash
+python3 -m venv venv
+source venv/bin/activate
+
+pip install r requirements.txt
+```
+
 Populate a config.py file with the IP of your DASH server:
 ```bash
 cp config_template.py config.py

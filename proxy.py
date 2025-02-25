@@ -6,15 +6,19 @@ import select
 import uuid
 import logging
 from collections import deque
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List
 from dataclasses import dataclass, field
+from config import DASH_SERVER_IP
+import xml.etree.ElementTree as ET  # Manifest XML Parsing
 
 # Constants
 LISTENER_ADDRESS = "127.0.0.1"
 LISTENER_PORT = 9000
-BUF_SIZE = 4096
-MAX_HEADERS_SIZE = 8192
+BUF_SIZE = 4096  # May not be necessary
+MAX_HEADERS_SIZE = 8192  # May not be necessary
 CONNECTION_QUEUE_LIMIT = 150
+DASH_IP = DASH_SERVER_IP
+DASH_PORT = 80  # For HTTP
 
 # Epoll flags
 READ_ONLY = select.EPOLLIN | select.EPOLLPRI | select.EPOLLHUP | select.EPOLLERR
@@ -39,7 +43,6 @@ class HTTPMessage:
     content_length: int = 0
     is_response: bool = False  # Otherwise is a request
     keep_alive: bool = True
-    x_request_id: Optional[str] = None  # Added into header for routing (load-balancing)
 
     def build(self) -> bytes:
         """Convert this HTTPMessage to a byte message"""
@@ -64,31 +67,28 @@ class Connection:
     """Connection state manager"""
     socket: socket.socket
     addr: tuple  # (IP, Port)
-    input_buffer: bytearray = field(default_factory=bytearray)   # Read buffer: received from the socket but not yet processed
-    output_buffer: bytearray = field(default_factory=bytearray)  # Write buffer: stores outgoing raw bytes waiting to be sent to THIS socket connection
-    current_message: Optional[HTTPMessage] = None                # The current HTTP message being processed (For partial/chunked HTTP requests)
-    pending_requests: deque = field(default_factory=deque)       # Queue of HTTPMessage Requests
-    pending_responses: deque = field(default_factory=deque)      # Queue of HTTPMessage Responses
-    request_order: deque = field(default_factory=deque)          # Tracks order of requests for Head-Of-Line blocking in our pipelining
-    headers_complete: bool = False  # Flag indicating if the current message has complete headers
-    headers_size: int = 0           # Tracks the size of received headers and enforces limits
-    body_received: int = 0          # Flag indicating if the current message has a complete body
-    is_backend: bool = False        # Otherwise is aclient connection
-    keep_alive: bool = True         # HTTP/1.1 "Persistent" Connection for multiple requests
+    input_buffer: bytearray = field(default_factory=bytearray)                  # Read buffer: received from the socket but not yet processed
+    output_buffer: bytearray = field(default_factory=bytearray)                 # Write buffer: stores outgoing raw bytes waiting to be sent to THIS socket connection
+    current_message: Optional[HTTPMessage] = None                               # The current HTTP message being processed (For partial/chunked HTTP requests)
+    pending_requests: deque = field(default_factory=deque)                      # Queue of HTTPMessage Requests
+    pending_responses: Dict[int, HTTPMessage] = field(default_factory=dict)     # Map of HTTPMessage Responses 
+    request_order: deque = field(default_factory=deque)                         # Tracks order of requests for Head-Of-Line blocking in our pipelining with a queue of backend fds
+    headers_complete: bool = False      # Flag indicating if the current message has complete headers
+    headers_size: int = 0               # Tracks the size of received headers and enforces limits
+    body_received: int = 0              # Flag indicating if the current message has a complete body
+    is_backend: bool = False            # Otherwise is aclient connection
+    keep_alive: bool = True             # HTTP/1.1 "Persistent" Connection for multiple requests
 
 class ProxyServer:
     def __init__(self, config_path: str):
-        self.backend_servers = self._load_config(config_path)  # Load backend servers from servers.conf
-        self.backend_index = 0                                 # Round-robin index for load balancing
-       
         # Stores active connections (client and backend), mapped by file descriptor (fd)
         self.connections: Dict[int, Connection] = {}    
 
-        # Stores available backend connections, with key="ip:port" : val=fd
-        self.backend_pool: Dict[str, Set[int]] = {}  # See NOTE under _get_backend_connection to see how this pool is managed
+        # Stores mapping from backend fd to client fd to map responses back to clients (many to one)
+        self.backend_client_map: Dict[int, int] = {}
 
-        # Maps 'X-Request-ID' to client fds to route responses back
-        self.request_map: Dict[str, int] = {}
+        # Stores the available_bitrates to select from (after parsing the manifest)
+        self.available_bitrates: List[int] = []
         
         # Initialize server socket
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)    # creates a new TCP socket
@@ -97,11 +97,6 @@ class ProxyServer:
         
         # Initialize epoll
         self.epoll = select.epoll()
-        
-    def _load_config(self, path: str) -> list:
-        "Load backend servers from a JSON config file"
-        with open(path) as f:
-            return json.load(f)["backend_servers"]
 
     def start(self):
         """Start the proxy server"""
@@ -109,21 +104,17 @@ class ProxyServer:
             self.server.bind((LISTENER_ADDRESS, LISTENER_PORT))   # Bind front-end server socket to server address
             self.server.listen(CONNECTION_QUEUE_LIMIT)            # Allow up to N queued connections
             self.epoll.register(self.server.fileno(), READ_ONLY)  # Register front-end socket with epoll()
-            
             logging.info(f"Proxy listening on {LISTENER_ADDRESS}:{LISTENER_PORT}")
             
             while True:
                 events = self.epoll.poll(timeout=1)
-
                 for fd, event in events:
                     if fd == self.server.fileno():
                         # Case 1: New client is connecting
                         self._accept_connection()
-
                     elif event & (select.EPOLLIN | select.EPOLLPRI):
                         # Case 2: Data from client/backend (new data or connection closed packet)
                         self._handle_read(fd)
-
                     elif event & select.EPOLLOUT:
                         # Case 3: Socket is ready to send data
                         self._handle_write(fd)
@@ -250,11 +241,9 @@ class ProxyServer:
                 v = v.strip()
                 msg.headers[k] = v
                 
-                # Check for meaningful headers: message size and routing
+                # Check for meaningful headers: message size
                 if k.lower() == 'content-length':
                     msg.content_length = int(v)
-                elif k == 'X-Request-ID':
-                    msg.x_request_id = v
         
         # If we've got here, we've successfully parsed complete headers and this can be our start for our current message
         conn.current_message = msg
@@ -267,64 +256,43 @@ class ProxyServer:
         conn = self.connections[fd]
         msg = conn.current_message
         
-        # If this message does not have a X-Request-ID (i.e., a client HTTP Request)
-        if not msg.x_request_id:
-            # Generate a uuid for it
-            msg.x_request_id = str(uuid.uuid4())
-            msg.headers['X-Request-ID'] = msg.x_request_id  # Add it to HTTP headers
-        
         # If this connection is from a client
-        if not conn.is_backend:
-            # Select the next backend server using round-robin load balancing - forward to backend
-            backend = self.backend_servers[self.backend_index]
-            self.backend_index = (self.backend_index + 1) % len(self.backend_servers)
-            
-            # Get existing connection to backend or make one
-            backend_fd = self._get_backend_connection(backend)
+        if not conn.is_backend:            
+            # Make a new backend connection for this request
+            backend_fd = self._open_backend_connection()
             
             if backend_fd:
                 # Add the HTTP request to the backend's output buffer for sending
                 backend_conn = self.connections[backend_fd]
                 backend_conn.output_buffer.extend(msg.build())
 
-                # Associate this X-Request-ID with FD, the Client socket (which we passed in)
-                self.request_map[msg.x_request_id] = fd
-                conn.request_order.append(msg.x_request_id)  # Maintain this order for Head-of-line blocking
+                # Associate this Backend FD with the Client socket (which we passed in)
+                self.backend_client_map[backend_fd] = fd
+                conn.request_order.append(backend_fd)
 
                 # Mark this backend socket as writable, so the send buffer can be sent
                 self.epoll.modify(backend_fd, READ_WRITE)
 
         else:
             # Backend response - forward to client (fd is our backend fd)
-            client_fd = self.request_map.get(msg.x_request_id)  # Use the X-Request-ID to get the client
+            client_fd = self.backend_client_map.get(fd)  # Use the backend fd to get the client
 
             if client_fd:
                 # Get the client connection object
                 client_conn = self.connections[client_fd]
 
-                # Append this complete HTTPMessage to the sending queue
-                client_conn.pending_responses.append(msg)
+                # Append this complete HTTPMessage to the dictionary
+                client_conn.pending_responses.append(msg)  # TODO: Won't be an append
                 self._prepare_client_response(client_fd)  # Prep the send buffer
 
-    def _get_backend_connection(self, backend: dict) -> Optional[int]:
-        """Get or create backend connection"""
-        # NOTE: The proxy does not open one connection per request, but per active client that persists for the client
-        #       - If a client sends multiple requests, it may reuse the same backend connection.
-        #       - If multiple clients request the same backend, the proxy may open multiple backend connections if needed.
-        #       - To avoid excessive socket creation, backend_pool stores reusable backend connections.
-        addr = f"{backend['ip']}:{backend['port']}"  # Identify backend by address
-        
-        # Check existing pool if we already have an open connection to this backend
-        if addr in self.backend_pool and self.backend_pool[addr]:
-            return self.backend_pool[addr].pop()
-        
-        # Otherwise, create a new connection to this backend
+    def _open_backend_connection(self) -> Optional[int]:
+        """Get or create backend connection"""        
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setblocking(False)
 
             # Attempt a non-blocking connection, rather than blocking until connection established or failed
-            sock.connect_ex((backend['ip'], backend['port']))
+            sock.connect_ex((DASH_IP, DASH_PORT))
             
             # Get the new fd from the socket
             fd = sock.fileno()
@@ -332,13 +300,9 @@ class ProxyServer:
             # Store this new backend connection in `connections`
             self.connections[fd] = Connection(
                 socket=sock,
-                addr=(backend['ip'], backend['port']),
+                addr=((DASH_IP, DASH_PORT)),
                 is_backend=True
             )
-            
-            # Ensure the backend pool exists for this address
-            if addr not in self.backend_pool:
-                self.backend_pool[addr] = set()
             
             # Register and return backend fd
             self.epoll.register(fd, READ_WRITE)
@@ -354,20 +318,17 @@ class ProxyServer:
         conn = self.connections[fd]
         
         # Head of line blocking! We want to send the clients their responses based on the order they requested
-        while conn.pending_responses and conn.request_order:
-            next_id = conn.request_order[0]
-            
-            # We look to match our X-Request-ID in our pending HTTPMessage responses
-            for resp in conn.pending_responses:
-                # If found, we can remove this from the order, remove it from the send_queue, and send out the convert bytes HTTPMessage
-                if resp.x_request_id == next_id:
-                    conn.request_order.popleft()
-                    conn.pending_responses.remove(resp)
-                    conn.output_buffer.extend(resp.build())
-                    self.epoll.modify(fd, READ_WRITE)
-                    return
-                    
-            break
+        if conn.pending_responses and conn.request_order:
+            next_backend_fd = conn.request_order[0]
+
+            while next_backend_fd in conn.pending_responses:
+                # We don't add to this dictionary unless the value exists, can safely grab it in resp
+                resp = conn.pending_responses[next_backend_fd]
+                conn.request_order.popleft()
+                conn.pending_responses.remove(next_backend_fd)  # remove by key
+                conn.output_buffer.extend(resp.build())
+                self.epoll.modify(fd, READ_WRITE)
+                next_backend_fd = conn.request_order[0]
 
     def _handle_write(self, fd: int):
         """Handle write events"""
