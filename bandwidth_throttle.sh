@@ -1,7 +1,7 @@
 #!/bin/bash
 # bandwidth_throttle_ingress.sh - Control ingress bandwidth throttling on enp1s0
 
-INTERFACE="enp0s1"
+INTERFACE="enp0s3"  # enp0s1
 DEFAULT_RATE="1mbit"   # Default limit (e.g., 1Mbps)
 DEFAULT_PORT=80        # Default HTTP port
 

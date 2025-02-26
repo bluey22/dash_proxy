@@ -3,25 +3,25 @@ import errno
 import socket
 import select
 import logging
+import time
+import argparse
+import xml.etree.ElementTree as ET
 from collections import deque
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
-import xml.etree.ElementTree as ET  # Manifest XML Parsing
 
 # Constants
-LISTENER_ADDRESS = "127.0.0.1"
-LISTENER_PORT = 9000
-BUF_SIZE = 4096  # May not be necessary
-MAX_HEADERS_SIZE = 8192  # May not be necessary
+BUF_SIZE = 16384  # Increased buffer size for video chunk transfers
 CONNECTION_QUEUE_LIMIT = 150
-DASH_IP = DASH_SERVER_IP
-DASH_PORT = 80  # For HTTP
+DASH_SERVER_IP = DASH_SERVER_IP
+DASH_PORT = 80  # Default HTTP port
 
-# Epoll flags
-READ_ONLY = select.EPOLLIN | select.EPOLLPRI | select.EPOLLHUP | select.EPOLLERR
-READ_WRITE = READ_ONLY | select.EPOLLOUT
+# Manifest file names
+MANIFEST_FILE = "manifest.mpd"
+MANIFEST_NOLIST_FILE = "manifest_nolist.mpd"
 
+# Log setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [proxy] [%(levelname)s] %(message)s",
@@ -39,8 +39,12 @@ class HTTPMessage:
     status_code: str = ""
     status_text: str = ""
     content_length: int = 0
-    is_response: bool = False  # Otherwise is a request
-    keep_alive: bool = True
+    is_response: bool = False
+    is_chunk_request: bool = False
+    chunk_name: str = ""
+    requested_bitrate: int = 0
+    is_manifest_request: bool = False
+    start_time: float = 0
 
     def build(self) -> bytes:
         """Convert this HTTPMessage to a byte message"""
@@ -65,65 +69,66 @@ class Connection:
     """Connection state manager"""
     socket: socket.socket
     addr: tuple  # (IP, Port)
-    input_buffer: bytearray = field(default_factory=bytearray)                  # Read buffer: received from the socket but not yet processed
-    output_buffer: bytearray = field(default_factory=bytearray)                 # Write buffer: stores outgoing raw bytes waiting to be sent to THIS socket connection
-    current_message: Optional[HTTPMessage] = None                               # The current HTTP message being processed (For partial/chunked HTTP requests)
-    pending_requests: deque = field(default_factory=deque)                      # Queue of HTTPMessage Requests
-    pending_responses: Dict[int, HTTPMessage] = field(default_factory=dict)     # Map of HTTPMessage Responses 
-    request_order: deque = field(default_factory=deque)                         # Tracks order of requests for Head-Of-Line blocking in our pipelining with a queue of backend fds
+    input_buffer: bytearray = field(default_factory=bytearray)      # Read buffer: received from the socket but not yet processed
+    output_buffer: bytearray = field(default_factory=bytearray)     # Write buffer: stores outgoing raw bytes waiting to be sent to THIS socket connection
+    current_message: Optional[HTTPMessage] = None                   # The current HTTP message being processed (For partial/chunked HTTP requests)
+    output_queue: deque = field(default_factory=deque)              # Queue of messages to be sent
     headers_complete: bool = False      # Flag indicating if the current message has complete headers
-    headers_size: int = 0               # Tracks the size of received headers and enforces limits
     body_received: int = 0              # Flag indicating if the current message has a complete body
     is_backend: bool = False            # Otherwise is aclient connection
-    keep_alive: bool = True             # HTTP/1.1 "Persistent" Connection for multiple requests
+    paired_fd: int = -1  # The paired connection's fd (client<->backend)
+    # keep_alive = True -> HTTP/1.1 "Persistent" Connections for multiple requests
 
-class ProxyServer:
-    def __init__(self, config_path: str):
-        # Stores active connections (client and backend), mapped by file descriptor (fd)
-        self.connections: Dict[int, Connection] = {}    
-
-        # Stores mapping from backend fd to client fd to map responses back to clients (many to one)
-        self.backend_client_map: Dict[int, int] = {}
-
-        # Stores the available_bitrates to select from (after parsing the manifest)
+class DASHProxy:
+    def __init__(self, log_file, alpha, port):
+        # Connections
+        self.connections: Dict[int, Connection] = {}
+        
+        # DASH streaming parameters
         self.available_bitrates: List[int] = []
+        self.current_throughput: float = 0
+        self.alpha: float = alpha  # EWMA smoothing factor
+        
+        # Logging
+        self.log_file = open(log_file, 'w')
         
         # Initialize server socket
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)    # creates a new TCP socket
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Socket option: allows immediate re-use of the same port
-        self.server.setblocking(False)  # Non-blocking socket
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.setblocking(False)
+        
+        # Bind and listen
+        self.server.bind(('0.0.0.0', port))
+        self.server.listen(CONNECTION_QUEUE_LIMIT)
         
         # Initialize epoll
         self.epoll = select.epoll()
+        self.epoll.register(self.server.fileno(), select.EPOLLIN)
+        
+        logging.info(f"DASH Proxy started on port {port} with alpha={alpha}")
 
     def start(self):
         """Start the proxy server"""
         try:
-            self.server.bind((LISTENER_ADDRESS, LISTENER_PORT))   # Bind front-end server socket to server address
-            self.server.listen(CONNECTION_QUEUE_LIMIT)            # Allow up to N queued connections
-            self.epoll.register(self.server.fileno(), READ_ONLY)  # Register front-end socket with epoll()
-            logging.info(f"Proxy listening on {LISTENER_ADDRESS}:{LISTENER_PORT}")
-            
             while True:
                 events = self.epoll.poll(timeout=1)
                 for fd, event in events:
                     if fd == self.server.fileno():
-                        # Case 1: New client is connecting
+                        # New client connection
                         self._accept_connection()
                     elif event & (select.EPOLLIN | select.EPOLLPRI):
-                        # Case 2: Data from client/backend (new data or connection closed packet)
+                        # Data available to read
                         self._handle_read(fd)
                     elif event & select.EPOLLOUT:
-                        # Case 3: Socket is ready to send data
+                        # Socket ready for writing
                         self._handle_write(fd)
                     
                     if event & (select.EPOLLHUP | select.EPOLLERR):
-                        # Case 4: error handling
+                        # Connection closed or error
                         self._close_connection(fd)
                         
         except KeyboardInterrupt:
             logging.info("Shutting down...")
-
         finally:
             self.cleanup()
 
@@ -140,15 +145,17 @@ class ProxyServer:
                 addr=addr
             )
             
-            # Register the socket file descriptor
-            self.epoll.register(fd, READ_ONLY)
-            logging.debug(f"Accepted connection from {addr}")
+            # Register for read events
+            self.epoll.register(fd, select.EPOLLIN)
             
         except socket.error as e:
             logging.error(f"Error accepting connection: {e}")
 
     def _handle_read(self, fd: int):
         """Handle read events"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         
         try:
@@ -157,10 +164,10 @@ class ProxyServer:
                 self._close_connection(fd)
                 return
             
-            # Read as much as possible into our input/read buffer
+            # Add data to input buffer
             conn.input_buffer.extend(data)
-
-            # Process input/read buffer
+            
+            # Process input buffer
             self._process_input(fd)
             
         except socket.error as e:
@@ -168,247 +175,513 @@ class ProxyServer:
                 self._close_connection(fd)
 
     def _process_input(self, fd: int):
-        """Process input buffer"""
+        """Process input buffer for HTTP messages"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         
-        while conn.input_buffer:  # While input_buffer is not empty
-
-            # Check 1: Does our current HTTP message have complete headers?
+        # Process the buffer until we can't extract complete messages
+        while conn.input_buffer:
+            # Parse headers if not done yet
             if not conn.headers_complete:
-
-                 # If not, process them and check again (Which we asserted was not empty => _process_headers accesses conn.input_buffer)
-                if not self._process_headers(conn): 
-                    break  # We need to wait for more data to complete our message
+                if not self._process_headers(conn):
+                    break  # Need more data
             
-            if conn.current_message:  # If headers are complete, and we're currently still building an HTTP message
-                remaining = conn.current_message.content_length - conn.body_received  # How many more bytes we need
+            # Process body if we have headers
+            if conn.current_message:
+                if conn.current_message.content_length > 0:
+                    # Calculate remaining body bytes
+                    remaining = conn.current_message.content_length - conn.body_received
+                    
+                    if remaining > 0:
+                        # Extract body data
+                        body_data = conn.input_buffer[:remaining]
+                        conn.current_message.body.extend(body_data)
+                        conn.body_received += len(body_data)
+                        
+                        # Remove processed bytes
+                        conn.input_buffer = conn.input_buffer[len(body_data):]
+                    
+                    # Check if message is complete
+                    if conn.body_received >= conn.current_message.content_length:
+                        self._handle_complete_message(fd)
+                    else:
+                        break  # Need more data
+                else:
+                    # No body or zero length
+                    self._handle_complete_message(fd)
                 
-                if remaining > 0:
-                    # Find these bytes from the remaining input_buffer
-                    body_data = conn.input_buffer[:remaining]  # In python, no index error here, just returns max (interesting)
-                    conn.current_message.body.extend(body_data)
-                    conn.body_received += len(body_data)
-
-                    # Input_buffer now is the rest of the message
-                    conn.input_buffer = conn.input_buffer[len(body_data):]
-                
-                # We have a full and complete body (a complete message)
+                # Reset for next message
                 if conn.body_received >= conn.current_message.content_length:
-                    self._handle_complete_message(fd)  # Route/send this to the correct socket
-
-                    # Reset our connection's current message
                     conn.headers_complete = False
                     conn.body_received = 0
-                    conn.headers_size = 0
                     conn.current_message = None
 
-                    # Run while loop again in case we have another message
-                else:
-                    break
-
     def _process_headers(self, conn: Connection) -> bool:
-        """Process HTTP headers. Returns whether or not we have a complete set of headers for a message"""
+        """Parse HTTP headers from input buffer"""
+        # Look for header terminator
         if b'\r\n\r\n' not in conn.input_buffer:
-            conn.headers_size += len(conn.input_buffer)
-            if conn.headers_size > MAX_HEADERS_SIZE:
-                return False  # In either case, exceed header size or end not found, this is not a complete header
-            return False  # Wait for more data
+            return False  # Incomplete headers
         
-        # Extract headers and remaining buffer
-        headers_data, conn.input_buffer = conn.input_buffer.split(b'\r\n\r\n', 1)
+        # Split headers from body
+        headers_data, remaining = conn.input_buffer.split(b'\r\n\r\n', 1)
+        conn.input_buffer = remaining  # Keep remaining data in buffer
+        
+        # Split into lines
         lines = headers_data.split(b'\r\n')
         
-        # Parse first line (Request or Response line)
-        first_line = lines[0].decode('utf-8')
+        # Parse first line
+        first_line = lines[0].decode('utf-8', errors='ignore')
         parts = first_line.split()
         
+        if len(parts) < 2:
+            # Invalid request/response line
+            return False
+        
+        # Create message object
         msg = HTTPMessage()
         
-        if parts[0].startswith('HTTP/'):  # Dealing with a response
+        # Set message type and parse first line
+        if parts[0].startswith('HTTP/'):  # Response
             msg.is_response = True
             msg.version = parts[0]
             msg.status_code = parts[1]
-            msg.status_text = ' '.join(parts[2:])
-
-        else:  # Dealing with a request
+            msg.status_text = ' '.join(parts[2:]) if len(parts) > 2 else ""
+        else:  # Request
             msg.method = parts[0]
             msg.path = parts[1]
-            msg.version = parts[2]
+            msg.version = parts[2] if len(parts) > 2 else "HTTP/1.1"
             
-        # Parse rest of headers for key-value pairs
+            # Check if this is a manifest request
+            if MANIFEST_FILE in msg.path:
+                msg.is_manifest_request = True
+            
+            # Check if this is a chunk request
+            if "Seg" in msg.path:
+                msg.is_chunk_request = True
+                msg.start_time = time.time()
+                self._extract_chunk_info(msg)
+        
+        # Parse header fields
         for line in lines[1:]:
             if b':' in line:
-                k, v = line.decode('utf-8').split(':', 1)
+                k, v = line.decode('utf-8', errors='ignore').split(':', 1)
                 k = k.strip()
                 v = v.strip()
                 msg.headers[k] = v
                 
-                # Check for meaningful headers: message size
+                # Get content length
                 if k.lower() == 'content-length':
-                    msg.content_length = int(v)
+                    try:
+                        msg.content_length = int(v)
+                    except ValueError:
+                        msg.content_length = 0
         
-        # If we've got here, we've successfully parsed complete headers and this can be our start for our current message
+        # Update connection state
         conn.current_message = msg
         conn.headers_complete = True
+        
         return True
 
+    def _extract_chunk_info(self, msg: HTTPMessage):
+        """Extract chunk name and bitrate from request path"""
+        path = msg.path
+        
+        # Find segment marker
+        seg_pos = path.find("Seg")
+        if seg_pos >= 0:
+            # Find boundaries of chunk name
+            slash_before = path.rfind("/", 0, seg_pos)
+            slash_after = path.find("/", seg_pos)
+            query_pos = path.find("?", seg_pos)
+            
+            # Determine end position
+            if slash_after >= 0 and query_pos >= 0:
+                end_pos = min(slash_after, query_pos)
+            elif slash_after >= 0:
+                end_pos = slash_after
+            elif query_pos >= 0:
+                end_pos = query_pos
+            else:
+                end_pos = len(path)
+            
+            # Determine start position
+            start_pos = slash_before + 1 if slash_before >= 0 else 0
+            
+            # Extract chunk name
+            chunk_name = path[start_pos:end_pos]
+            msg.chunk_name = chunk_name
+            
+            # Extract bitrate from chunk name
+            try:
+                # Extract numeric part before "Seg"
+                bitrate_part = chunk_name.split("Seg")[0]
+                bitrate = int(''.join(c for c in bitrate_part if c.isdigit()))
+                msg.requested_bitrate = bitrate
+            except (ValueError, IndexError):
+                pass
+
     def _handle_complete_message(self, fd: int):
-        """Handle complete HTTP message"""
-        # Retrieve the connection object with the fd, and the complete message
+        """Process a complete HTTP message"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         msg = conn.current_message
         
-        # If this connection is from a client
-        if not conn.is_backend:            
-            # Make a new backend connection for this request
-            backend_fd = self._open_backend_connection()
+        if conn.is_backend:
+            # This is a response from the backend to be sent to the client
+            client_fd = conn.paired_fd
             
-            if backend_fd:
-                # Add the HTTP request to the backend's output buffer for sending
-                backend_conn = self.connections[backend_fd]
-                backend_conn.output_buffer.extend(msg.build())
-
-                # Associate this Backend FD with the Client socket (which we passed in)
-                self.backend_client_map[backend_fd] = fd
-                conn.request_order.append(backend_fd)
-
-                # Mark this backend socket as writable, so the send buffer can be sent
-                self.epoll.modify(backend_fd, READ_WRITE)
-
-        else:
-            # Backend response - forward to client (fd is our backend fd)
-            client_fd = self.backend_client_map.get(fd)  # Use the backend fd to get the client
-
-            if client_fd:
-                # Get the client connection object
+            if client_fd in self.connections:
                 client_conn = self.connections[client_fd]
+                
+                # If this is a chunk response, calculate throughput
+                if msg.is_response and client_conn.current_message and client_conn.current_message.is_chunk_request:
+                    self._calculate_throughput(client_conn.current_message, msg)
+                
+                # Queue response for client
+                client_conn.output_queue.append(msg)
+                
+                # Update epoll if needed
+                if not client_conn.output_buffer:
+                    self._prepare_next_message(client_fd)
+        else:
+            # This is a request from the client to be sent to the backend
+            
+            # If this is a manifest request, fetch the actual manifest first
+            if msg.is_manifest_request:
+                self._handle_manifest_request(fd, msg)
+                return
+            
+            # For chunk requests, modify the bitrate
+            if msg.is_chunk_request:
+                self._modify_chunk_request(msg)
+            
+            # Get or create backend connection
+            backend_fd = self._get_backend_connection(fd)
+            
+            if backend_fd and backend_fd in self.connections:
+                backend_conn = self.connections[backend_fd]
+                
+                # Queue the request for the backend
+                backend_conn.output_queue.append(msg)
+                
+                # Update epoll if needed
+                if not backend_conn.output_buffer:
+                    self._prepare_next_message(backend_fd)
 
-                # Append this complete HTTPMessage to the dictionary
-                client_conn.pending_responses.append(msg)  # TODO: Won't be an append
-                self._prepare_client_response(client_fd)  # Prep the send buffer
+    def _handle_manifest_request(self, client_fd: int, client_msg: HTTPMessage):
+        """Handle manifest request: fetch actual manifest and modify client request"""
+        # First, fetch the actual manifest to get bitrates
+        self._fetch_manifest(client_msg.path)
+        
+        # Replace manifest.mpd with manifest_nolist.mpd in the request
+        modified_path = client_msg.path.replace(MANIFEST_FILE, MANIFEST_NOLIST_FILE)
+        client_msg.path = modified_path
+        
+        # Forward the modified request to the backend
+        backend_fd = self._get_backend_connection(client_fd)
+        
+        if backend_fd and backend_fd in self.connections:
+            backend_conn = self.connections[backend_fd]
+            backend_conn.output_queue.append(client_msg)
+            
+            if not backend_conn.output_buffer:
+                self._prepare_next_message(backend_fd)
 
-    def _open_backend_connection(self) -> Optional[int]:
-        """Get or create backend connection"""        
+    def _fetch_manifest(self, path: str):
+        """Fetch manifest.mpd directly and parse available bitrates"""
         try:
+            # Create a separate socket for this synchronous request
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setblocking(False)
+            sock.connect((DASH_SERVER_IP, DASH_PORT))
+            
+            # Replace manifest_nolist.mpd with manifest.mpd if needed
+            actual_path = path.replace(MANIFEST_NOLIST_FILE, MANIFEST_FILE)
+            
+            # Prepare HTTP request
+            request = f"GET {actual_path} HTTP/1.1\r\nHost: {DASH_SERVER_IP}\r\nConnection: close\r\n\r\n"
+            
+            # Send request
+            sock.sendall(request.encode())
+            
+            # Receive response
+            response = bytearray()
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                response.extend(data)
+            
+            sock.close()
+            
+            # Extract body from response
+            if b'\r\n\r\n' in response:
+                body = response.split(b'\r\n\r\n', 1)[1]
+                
+                # Parse XML to extract bitrates
+                self._parse_manifest(body.decode('utf-8', errors='ignore'))
+                
+        except Exception as e:
+            logging.error(f"Error fetching manifest: {e}")
 
-            # Attempt a non-blocking connection, rather than blocking until connection established or failed
-            sock.connect_ex((DASH_IP, DASH_PORT))
+    def _parse_manifest(self, manifest_content: str):
+        """Parse manifest XML to extract available bitrates"""
+        try:
+            root = ET.fromstring(manifest_content)
             
-            # Get the new fd from the socket
-            fd = sock.fileno()
+            # Extract bitrates from Representation elements
+            bitrates = []
             
-            # Store this new backend connection in `connections`
-            self.connections[fd] = Connection(
-                socket=sock,
-                addr=((DASH_IP, DASH_PORT)),
-                is_backend=True
+            # Define namespace if present in XML
+            namespace = ''
+            if '}' in root.tag:
+                namespace = '{' + root.tag.split('}')[0].strip('{') + '}'
+            
+            # Find all Representation elements
+            for representation in root.findall(f".//{namespace}Representation"):
+                if 'bandwidth' in representation.attrib:
+                    try:
+                        # Convert from bps to Kbps
+                        bitrate = int(representation.attrib['bandwidth']) // 1000
+                        if bitrate > 0:
+                            bitrates.append(bitrate)
+                    except ValueError:
+                        pass
+            
+            # Sort bitrates
+            self.available_bitrates = sorted(bitrates)
+            logging.info(f"Available bitrates: {self.available_bitrates}")
+            
+        except Exception as e:
+            logging.error(f"Error parsing manifest: {e}")
+
+    def _modify_chunk_request(self, msg: HTTPMessage):
+        """Modify chunk request to use appropriate bitrate"""
+        if not self.available_bitrates:
+            return  # No bitrates available yet
+        
+        # Select best bitrate based on throughput
+        new_bitrate = self._select_bitrate()
+        
+        # If no change needed, return
+        if new_bitrate == msg.requested_bitrate:
+            return
+        
+        # Replace bitrate in chunk name
+        old_chunk = msg.chunk_name
+        if old_chunk and msg.requested_bitrate > 0:
+            new_chunk = old_chunk.replace(str(msg.requested_bitrate), str(new_bitrate))
+            
+            # Update path
+            msg.path = msg.path.replace(old_chunk, new_chunk)
+            
+            # Update chunk info
+            msg.chunk_name = new_chunk
+            msg.requested_bitrate = new_bitrate
+
+    def _select_bitrate(self) -> int:
+        """Select appropriate bitrate based on throughput"""
+        if not self.available_bitrates:
+            return 100  # Default minimum bitrate
+        
+        # Select highest bitrate where throughput >= 1.5 * bitrate
+        target_throughput = self.current_throughput / 1.5
+        selected = self.available_bitrates[0]  # Start with lowest
+        
+        for bitrate in self.available_bitrates:
+            if bitrate <= target_throughput:
+                selected = bitrate
+            else:
+                break
+        
+        return selected
+
+    def _calculate_throughput(self, request: HTTPMessage, response: HTTPMessage):
+        """Calculate and update throughput based on chunk download"""
+        # Calculate download time
+        download_time = time.time() - request.start_time
+        
+        if download_time <= 0:
+            return
+        
+        # Get chunk size in bits
+        chunk_size = response.content_length * 8
+        
+        # Calculate throughput in Kbps
+        throughput = chunk_size / 1000 / download_time
+        
+        # Update EWMA throughput
+        if self.current_throughput == 0:
+            self.current_throughput = throughput
+        else:
+            self.current_throughput = self.alpha * throughput + (1 - self.alpha) * self.current_throughput
+        
+        # Log the download
+        log_entry = f"{int(time.time())} {download_time:.2f} {throughput:.2f} {self.current_throughput:.2f} {request.requested_bitrate} {request.chunk_name}\n"
+        self.log_file.write(log_entry)
+        self.log_file.flush()
+        
+        logging.info(f"Chunk: {request.chunk_name}, Tput: {throughput:.2f} Kbps, Avg: {self.current_throughput:.2f} Kbps")
+
+    def _get_backend_connection(self, client_fd: int) -> Optional[int]:
+        """Get or create backend connection for a client"""
+        if client_fd not in self.connections:
+            return None
+        
+        client_conn = self.connections[client_fd]
+        
+        # Check if client already has a backend connection
+        if client_conn.paired_fd != -1 and client_conn.paired_fd in self.connections:
+            return client_conn.paired_fd
+        
+        # Create new backend connection
+        try:
+            # Create socket
+            backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backend_socket.setblocking(False)
+            
+            # Start non-blocking connect
+            err = backend_socket.connect_ex((DASH_SERVER_IP, DASH_PORT))
+            if err != 0 and err != errno.EINPROGRESS:
+                backend_socket.close()
+                return None
+            
+            # Get backend fd
+            backend_fd = backend_socket.fileno()
+            
+            # Create connection object
+            self.connections[backend_fd] = Connection(
+                socket=backend_socket,
+                addr=(DASH_SERVER_IP, DASH_PORT),
+                is_backend=True,
+                paired_fd=client_fd
             )
             
-            # Register and return backend fd
-            self.epoll.register(fd, READ_WRITE)
-            return fd
+            # Link client to backend
+            client_conn.paired_fd = backend_fd
+            
+            # Register with epoll
+            self.epoll.register(backend_fd, select.EPOLLIN)
+            
+            return backend_fd
             
         except socket.error as e:
-            logging.error(f"Backend connection error: {e}")
+            logging.error(f"Error creating backend connection: {e}")
             return None
 
-    def _prepare_client_response(self, fd: int):
-        """Prepare next response for the client (from the backend)"""
-        # Get the connection object
+    def _prepare_next_message(self, fd: int):
+        """Prepare next message for sending"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         
-        # Head of line blocking! We want to send the clients their responses based on the order they requested
-        while conn.pending_responses and conn.request_order and conn.request_order[0] in conn.pending_responses:
-            next_backend_fd = conn.request_order[0]
-
-            # We don't add to this dictionary unless the value exists, can safely grab it in resp
-            resp = conn.pending_responses[next_backend_fd]
-            conn.request_order.popleft()
-            conn.pending_responses.remove(next_backend_fd)  # remove by key
-            conn.output_buffer.extend(resp.build())
-            self.epoll.modify(fd, READ_WRITE)
+        # If buffer is not empty, don't add more data
+        if conn.output_buffer:
+            return
+        
+        # Get next message from queue
+        if conn.output_queue:
+            next_msg = conn.output_queue.popleft()
+            conn.output_buffer.extend(next_msg.build())
+            
+            # Update epoll to include write events
+            self.epoll.modify(fd, select.EPOLLIN | select.EPOLLOUT)
 
     def _handle_write(self, fd: int):
         """Handle write events"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         
-        # If items to send queued in output_buffer
+        # Send data in output buffer
         if conn.output_buffer:
             try:
-                # Try and send as much as we can
                 sent = conn.socket.send(conn.output_buffer)
                 conn.output_buffer = conn.output_buffer[sent:]
                 
-                # If we sent out the entire buffer
+                # If buffer is empty, prepare next message or update epoll
                 if not conn.output_buffer:
-
-                    if conn.is_backend:
-                        # Add the next request to this buffer (to backend)
-                        self._prepare_next_request(fd)
+                    if conn.output_queue:
+                        self._prepare_next_message(fd)
                     else:
-                        # Add the next response to this buffer (to the client_)
-                        self._prepare_client_response(fd)
-
-                    # Check again due to side effects from _prepare_next or _prepare_client    
-                    if not conn.output_buffer:
-                        self.epoll.modify(fd, READ_ONLY)
+                        self.epoll.modify(fd, select.EPOLLIN)
                         
             except socket.error as e:
                 if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                     self._close_connection(fd)
 
-    def _prepare_next_request(self, fd: int):
-        """Prepare next request for backend"""
-        # Get the backend connection
+    def _close_connection(self, fd: int):
+        """Close connection and clean up resources"""
+        if fd not in self.connections:
+            return
+            
         conn = self.connections[fd]
         
-        # Retrieve the next request from this client (fd), and place the request to be forwarded in the send buffer
-        if conn.pending_requests:
-            req = conn.pending_requests.popleft()
-            conn.output_buffer.extend(req.build())
-            self.epoll.modify(fd, READ_WRITE)
-
-    def _close_connection(self, fd: int):
-        """Close connection and cleanup"""
-        if fd in self.connections:
-            conn = self.connections[fd]
+        try:
+            # Unregister from epoll
+            self.epoll.unregister(fd)
             
-            try:
-                self.epoll.unregister(fd)
-            except:
-                pass
+            # Close socket
+            conn.socket.close()
+            
+            # Close paired connection if it exists
+            paired_fd = conn.paired_fd
+            if paired_fd != -1 and paired_fd in self.connections:
+                paired_conn = self.connections[paired_fd]
+                paired_conn.paired_fd = -1  # Remove the pairing
                 
-            try:
-                conn.socket.close()
-            except:
-                pass
-                
-            # Cleanup connection state
-            if conn.is_backend:
-                addr = f"{conn.addr[0]}:{conn.addr[1]}"
-                # TODO
-                pass
-            else:
-                # Cleanup any pending requests
-                # TODO
-                pass
-                        
-            del self.connections[fd]  # Remove from active connections
+                # If this is a client connection closing, close the backend too
+                if not conn.is_backend:
+                    self._close_connection(paired_fd)
+            
+            # Remove from connections dict
+            self.connections.pop(fd)
+            
+        except Exception as e:
+            logging.error(f"Error closing connection: {e}")
 
-    def cleanup(self):  
-        """Cleanup server resources"""
-        # Close all sockets
+    def cleanup(self):
+        """Clean up all resources"""
+        # Close all connections
         for fd in list(self.connections.keys()):
-            self._close_connection(fd)
+            try:
+                self._close_connection(fd)
+            except:
+                pass
         
-        # Close self
-        self.epoll.unregister(self.server.fileno())
-        self.epoll.close()
-        self.server.close()
+        # Close server socket
+        try:
+            self.epoll.unregister(self.server.fileno())
+            self.epoll.close()
+            self.server.close()
+        except:
+            pass
+        
+        # Close log file
+        if self.log_file:
+            self.log_file.close()
+
+def main():
+    parser = argparse.ArgumentParser(description='HTTP Proxy for Adaptive Streaming')
+    parser.add_argument('log_file', help='Path to the log file')
+    parser.add_argument('alpha', type=float, help='Smoothing factor for EWMA (0-1)')
+    parser.add_argument('port', type=int, help='Port to listen on')
+    
+    args = parser.parse_args()
+    
+    # Validate alpha
+    if args.alpha < 0 or args.alpha > 1:
+        print("Error: alpha must be between 0 and 1")
+        return
+    
+    # Start proxy
+    proxy = DASHProxy(args.log_file, args.alpha, args.port)
+    proxy.start()
 
 if __name__ == "__main__":
-    # Driver code
-    proxy = ProxyServer("servers.conf")
-    proxy.start()
+    main()
