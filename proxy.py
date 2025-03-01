@@ -441,7 +441,8 @@ class DASHProxy:
             if client_fd in self.connections:
                 client_conn = self.connections[client_fd]
                 
-                # If this is a chunk response, calculate throughput
+                # NEW: If this is a chunk response, calculate throughput 
+                # (We can get our RTT now that we've full read in the chunk into our message)
                 if msg.is_response and client_conn.current_message and client_conn.current_message.is_chunk_request:
                     self._calculate_throughput(client_conn.current_message, msg)
                 
