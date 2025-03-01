@@ -458,7 +458,7 @@ class DASHProxy:
                 sent = conn.socket.send(conn.output_buffer)
                 conn.output_buffer = conn.output_buffer[sent:]
                 
-                # If buffer is empty, update epoll to remove write events
+                # If buffer is empty, update epoll to remove write events (just read events)
                 if not conn.output_buffer:
                     self.epoll.modify(fd, select.EPOLLIN)
                         

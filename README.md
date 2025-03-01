@@ -33,14 +33,24 @@ cp config_template.py config.py
 ## How to Run:
 
 ## Functionality:
-- Adaptive Bitrate Selection: It intercepts HTTP requests for video chunks and modifies the requested bitrate based on the client’s estimated bandwidth.
-- Manifest File Handling: It replaces requests for manifest.mpd with
-manifest_nolist.mpd in the client’s request to disable the browsers’
-internal bitrate adaptation. Internally, it fetches the actual manifest.mpd
+- The Dash Proxy estimates throughput for each video chunk with Chunk Size (bits) / Download Time (seconds), then uses an Exponentially Weighted Moving Average (EWMA): 
+    - T_current = a * T_new + (1 - a)*T_prev
+    - 0 < a < 1 controls reactivity to estimates (smoothness). a = alpha value
+- Logs detailed data in a file with lines of 
+<time><duration><throughput-chunk><avg-throughput-estimate><bitrate-requested><chunk-name>
+- The proxy estimates the bandwidth once per requested chunk
+- Handling multiple client connections through epoll and response/request pipelining
+
 
 ## Notes:
 ### On Bandwidith Estimation
 The proxy estimates the available bandwidth purely based on how long it takes to download each chunk from the DASH server. The assumption here is that the proxy-to-client connection is fast and reliable (usually on the same local network), so the main bottleneck is the server-to-proxy link. If that link is slow, the proxy adapts by choosing lower-bitrate chunks.
+- The proxy should select the highest bitrate for which the current throughput is at
+least 1.5 times the bitrate
+- Your proxy should learn which bitrates are available for a given video by parsing
+the manifest file, manifest.mpd. The manifest file is encoded in XML; Bitrates
+are defined in the manifest file as <Representation> elements with a
+bandwidth attribute
 
 ### On CDNs
 **Scope Note:** 
