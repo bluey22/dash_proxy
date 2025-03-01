@@ -32,6 +32,78 @@ cp config_template.py config.py
 ```
 ## How to Run:
 
+### 1. Start the proxy
+```bash
+python proxy.py proxy.log 0.5 9999
+```
+This starts the proxy with:
+
+- **Log file**: `proxy.log`
+- **Alpha value**: `0.5` (medium responsiveness)
+- **Port**: `9999`
+
+### 2. Access the video
+
+1. Open your web browser
+2. Navigate to: [http://localhost:9999/index.html](http://localhost:9999/index.html)
+   - This connects to your proxy, which then forwards requests to the DASH server.
+
+### 3. Test with bandwidth throttling
+
+First, modify the `bandwidth_throttle_ingress.sh` script to use your actual network interface. Make sure you edited this script to include your INTERFACE. 
+
+Find your interface name with:
+```bash
+ip a
+```
+
+Then update the `INTERFACE` variable in the script:
+```bash
+INTERFACE="your_interface_name"  # Replace with your actual interface, e.g., eth0, wlan0, etc.
+```
+
+Now you can use the script to simulate different network conditions:
+```bash
+# Limit bandwidth to 500 Kbps (low quality should be selected)
+./bandwidth_throttle_ingress.sh set 500kbit 80
+
+# After watching for a while, increase to 1 Mbps (medium quality)
+./bandwidth_throttle_ingress.sh set 1mbit 80
+
+# Then increase to 2 Mbps (should select higher quality)
+./bandwidth_throttle_ingress.sh set 2mbit 80
+
+# Remove limitations when done
+./bandwidth_throttle_ingress.sh clean
+```
+
+### 4. Visualize results
+
+After playing the video for about a minute with various bandwidth settings, stop the proxy.
+Run the `grapher.py` script to visualize the data:
+```bash
+python grapher.py
+```
+This will create a graph showing:
+
+- **Measured bandwidth** (blue line)
+- **EWMA bandwidth estimate** (red dashed line)
+- **Selected bitrate** (green line)
+
+### 5. Experiment with different alpha values
+
+- Repeat the test with `alpha=0.1` (slow to adapt, very smooth)
+- Repeat with `alpha=0.9` (fast to adapt, more responsive to changes)
+- Compare the graphs to see how alpha affects adaptation
+
+## Expected Behavior
+
+- With low bandwidth (500 Kbps), your proxy should select a low bitrate.
+- As bandwidth increases, the proxy should gradually select higher bitrates.
+- The alpha value will affect how quickly the proxy responds to bandwidth changes:
+  - **Low alpha (0.1)**: Slower, more conservative adaptation
+  - **High alpha (0.9)**: Faster adaptation, but may fluctuate more
+
 ## Functionality:
 - The Dash Proxy estimates throughput for each video chunk with Chunk Size (bits) / Download Time (seconds), then uses an Exponentially Weighted Moving Average (EWMA): 
     - T_current = a * T_new + (1 - a)*T_prev
