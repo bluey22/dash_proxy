@@ -10,6 +10,10 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
 
+# For Manifest Heartbeat only (Not Socket Connections nor Messages)
+import threading
+import time
+
 # Constants
 BUF_SIZE = 16384  # Increased buffer size for video chunk transfers (16KB reads at a time)
 CONNECTION_QUEUE_LIMIT = 150
@@ -90,7 +94,18 @@ class DASHProxy:
         self.available_bitrates: List[int] = []
         self.current_throughput: float = 0
         self.alpha: float = alpha  # EWMA smoothing factor
+
+        # Manifest Heartbeat (woah, profound)
+        self.manifest_refresh_interval: int = 5  # Seconds between manifest refreshes
+        self.manifest_last_path: str = ""  # Store the last path used to fetch manifest
+        self.manifest_lock = threading.Lock()  # For thread-safe access to bitrates
         
+        # Start manifest refresh thread (move to start?)
+        self.manifest_refresh_active = True
+        self.manifest_refresh_thread = threading.Thread(target=self._refresh_manifest_periodically)
+        self.manifest_refresh_thread.daemon = True
+        self.manifest_refresh_thread.start()
+
         # Proxy Logging
         self.log_file = open(log_file, 'w')
         
@@ -134,6 +149,24 @@ class DASHProxy:
             logging.info("Shutting down...")
         finally:
             self.cleanup()
+
+    # -------------------------- DASH Proxy Background Thread ----------------------------
+    def _refresh_manifest_periodically(self):
+        """Background thread that periodically refreshes the manifest"""
+        is_fetching = False  # Flag to track if we're currently fetching
+        
+        while self.manifest_refresh_active:
+            time.sleep(self.manifest_refresh_interval)
+            
+            if self.manifest_last_path and not is_fetching:
+                try:
+                    is_fetching = True
+                    self._fetch_manifest_worker(self.manifest_last_path)
+                    logging.info("Refreshed manifest in background thread")
+                except Exception as e:
+                    logging.error(f"Error in manifest refresh: {e}")
+                finally:
+                    is_fetching = False
 
     # -------------------------- Connection Creation Methods -----------------------------------
     def _accept_connection(self):
@@ -417,7 +450,8 @@ class DASHProxy:
                 client_conn.output_buffer.extend(response_bytes)
                 
                 # Update epoll if needed
-                if len(client_conn.output_buffer) == len(response_bytes):  # Buffer was empty before
+                if len(client_conn.output_buffer) == len(response_bytes):  
+                    # Ensure buffer includes write so client_fd can trigger and EPOLLOUT event (which flushes it's Connection.write_buffer)
                     self.epoll.modify(client_fd, select.EPOLLIN | select.EPOLLOUT)
         else:
             # This is a request from the client to be sent to the backend
@@ -442,7 +476,8 @@ class DASHProxy:
                 backend_conn.output_buffer.extend(request_bytes)
                 
                 # Update epoll if needed
-                if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before
+                if len(backend_conn.output_buffer) == len(request_bytes):  
+                    # Ensure buffer includes write so backend_fd can trigger and EPOLLOUT event (which flushes it's Connection.write_buffer)
                     self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
     def _handle_write(self, fd: int):
@@ -458,7 +493,9 @@ class DASHProxy:
                 sent = conn.socket.send(conn.output_buffer)
                 conn.output_buffer = conn.output_buffer[sent:]
                 
-                # If buffer is empty, update epoll to remove write events (just read events)
+                # If buffer is empty, update epoll to read events
+                # AKA, stop monitoring for write events when we have nothing left to send 
+                #   (level-triggered epoll, trying to avoid big-o = Select)
                 if not conn.output_buffer:
                     self.epoll.modify(fd, select.EPOLLIN)
                         
@@ -466,11 +503,22 @@ class DASHProxy:
                 if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                     self._close_connection(fd)
 
-# -------------------------- Adaptive Bitrate Methods -----------------------------------
+    # -------------------------- Adaptive Bitrate Methods -----------------------------------
     def _handle_manifest_request(self, client_fd: int, client_msg: HTTPMessage):
-        """Handle manifest request: fetch actual manifest and modify client request"""
+        """
+        Handle manifest request: fetch actual manifest and modify client request
+        
+        Called by _handle_complete_message() when:
+            - Request is from the client to be sent to the backend
+            - The Request is a manifest request (after headers parsed)
+        """
+        # Store the manifest path for future refreshes
+        self.manifest_last_path = client_msg.path
+
         # First, fetch the actual manifest to get bitrates
-        self._fetch_manifest(client_msg.path)
+        if not self.available_bitrates:
+            # First time fetch - do it synchronously so we have bitrates immediately
+            self._fetch_manifest_worker(client_msg.path)
         
         # Replace manifest.mpd with manifest_nolist.mpd in the request
         modified_path = client_msg.path.replace(MANIFEST_FILE, MANIFEST_NOLIST_FILE)
@@ -487,14 +535,55 @@ class DASHProxy:
             backend_conn.output_buffer.extend(request_bytes)
             
             # Update epoll if needed
-            if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before
+            if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before (was write before)
                 self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
-    def _fetch_manifest(self, path: str):
-        """Fetch manifest.mpd directly and parse available bitrates"""
+    # def _fetch_manifest(self, path: str):
+        """
+        BLOCKING VERSION
+        Fetch manifest.mpd directly and parse available bitrates
+        
+        Called by _handle_manifest_request() when a client requests the manifest from DASH"""
+        # try:
+        #     # Create a separate socket for this synchronous request
+        #     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #     sock.connect((DASH_SERVER_IP, DASH_PORT))
+            
+        #     # Replace manifest_nolist.mpd with manifest.mpd if needed
+        #     actual_path = path.replace(MANIFEST_NOLIST_FILE, MANIFEST_FILE)
+            
+        #     # Prepare HTTP request
+        #     request = f"GET {actual_path} HTTP/1.1\r\nHost: {DASH_SERVER_IP}\r\nConnection: close\r\n\r\n"
+            
+        #     # Send request
+        #     sock.sendall(request.encode())
+            
+        #     # Receive response
+        #     response = bytearray()
+        #     while True:
+        #         data = sock.recv(4096)
+        #         if not data:
+        #             break
+        #         response.extend(data)
+            
+        #     sock.close()
+            
+        #     # Extract body from response
+        #     if b'\r\n\r\n' in response:
+        #         body = response.split(b'\r\n\r\n', 1)[1]
+                
+        #         # Parse XML to extract bitrates
+        #         self._parse_manifest(body.decode('utf-8', errors='ignore'))
+                
+        # except Exception as e:
+        #     logging.error(f"Error fetching manifest: {e}")
+
+    def _fetch_manifest_worker(self, path: str):
+        """Worker function that actually fetches the manifest"""
         try:
             # Create a separate socket for this synchronous request
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)  # 5-second timeout to prevent indefinite blocking
             sock.connect((DASH_SERVER_IP, DASH_PORT))
             
             # Replace manifest_nolist.mpd with manifest.mpd if needed
@@ -509,10 +598,14 @@ class DASHProxy:
             # Receive response
             response = bytearray()
             while True:
-                data = sock.recv(4096)
-                if not data:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    response.extend(data)
+                except socket.timeout:
+                    logging.warning("Socket timeout while receiving manifest")
                     break
-                response.extend(data)
             
             sock.close()
             
@@ -525,7 +618,7 @@ class DASHProxy:
                 
         except Exception as e:
             logging.error(f"Error fetching manifest: {e}")
-
+            
     def _parse_manifest(self, manifest_content: str):
         """Parse manifest XML to extract available bitrates"""
         try:
@@ -551,7 +644,12 @@ class DASHProxy:
                         pass
             
             # Sort bitrates
-            self.available_bitrates = sorted(bitrates)
+            sorted_bitrates = sorted(bitrates)
+
+            # Thread-safe update of available_bitrates
+            with self.manifest_lock:
+                self.available_bitrates = sorted_bitrates
+
             logging.info(f"Available bitrates: {self.available_bitrates}")
             
         except Exception as e:
@@ -583,20 +681,21 @@ class DASHProxy:
 
     def _select_bitrate(self) -> int:
         """Select appropriate bitrate based on throughput"""
-        if not self.available_bitrates:
-            return 100  # Default minimum bitrate
-        
-        # Select highest bitrate where throughput >= 1.5 * bitrate
-        target_throughput = self.current_throughput / 1.5
-        selected = self.available_bitrates[0]  # Start with lowest
-        
-        for bitrate in self.available_bitrates:
-            if bitrate <= target_throughput:
-                selected = bitrate
-            else:
-                break
-        
-        return selected
+        with self.manifest_lock:
+            if not self.available_bitrates:
+                return 100  # Default minimum bitrate
+            
+            # Select highest bitrate where throughput >= 1.5 * bitrate
+            target_throughput = self.current_throughput / 1.5
+            selected = self.available_bitrates[0]  # Start with lowest
+            
+            for bitrate in self.available_bitrates:
+                if bitrate <= target_throughput:
+                    selected = bitrate
+                else:
+                    break
+            
+            return selected
 
     def _calculate_throughput(self, request: HTTPMessage, response: HTTPMessage):
         """Calculate and update throughput based on chunk download"""
@@ -662,6 +761,15 @@ class DASHProxy:
 
     def cleanup(self):
         """Clean up all resources"""
+        # Stop the manifest refresh background thread
+        self.manifest_refresh_active = False
+        if hasattr(self, 'manifest_refresh_thread') and self.manifest_refresh_thread.is_alive():
+            try:
+                self.manifest_refresh_thread.join(timeout=1.0)  # Wait up to 1 second
+                logging.info("Successfully joined manifest refresh thread")
+            except Exception as e:
+                logging.warning(f"Error joining manifest refresh thread: {e}")
+
         # Close all connections
         for fd in list(self.connections.keys()):
             try:
