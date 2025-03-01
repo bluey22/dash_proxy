@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
 
 # Constants
-BUF_SIZE = 16384  # Increased buffer size for video chunk transfers
+BUF_SIZE = 16384  # Increased buffer size for video chunk transfers (16KB reads at a time)
 CONNECTION_QUEUE_LIMIT = 150
 DASH_SERVER_IP = DASH_SERVER_IP
 DASH_PORT = 80  # Default HTTP port
@@ -72,7 +72,6 @@ class Connection:
     input_buffer: bytearray = field(default_factory=bytearray)      # Read buffer: received from the socket but not yet processed
     output_buffer: bytearray = field(default_factory=bytearray)     # Write buffer: stores outgoing raw bytes waiting to be sent to THIS socket connection
     current_message: Optional[HTTPMessage] = None                   # The current HTTP message being processed (For partial/chunked HTTP requests)
-    output_queue: deque = field(default_factory=deque)              # Queue of messages to be sent
     headers_complete: bool = False      # Flag indicating if the current message has complete headers
     body_received: int = 0              # Flag indicating if the current message has a complete body
     is_backend: bool = False            # Otherwise is aclient connection
@@ -89,7 +88,7 @@ class DASHProxy:
         self.current_throughput: float = 0
         self.alpha: float = alpha  # EWMA smoothing factor
         
-        # Logging
+        # Proxy Logging
         self.log_file = open(log_file, 'w')
         
         # Initialize server socket
@@ -107,6 +106,7 @@ class DASHProxy:
         
         logging.info(f"DASH Proxy started on port {port} with alpha={alpha}")
 
+    # -------------------------- DASH Proxy Main Loop -----------------------------------
     def start(self):
         """Start the proxy server"""
         try:
@@ -132,6 +132,7 @@ class DASHProxy:
         finally:
             self.cleanup()
 
+    # -------------------------- Connection Creation Methods -----------------------------------
     def _accept_connection(self):
         """Accept new client connection"""
         try:
@@ -150,7 +151,54 @@ class DASHProxy:
             
         except socket.error as e:
             logging.error(f"Error accepting connection: {e}")
+    
+    def _get_backend_connection(self, client_fd: int) -> Optional[int]:
+        """Get existing socket or create backend connection for a client"""
+        if client_fd not in self.connections:
+            return None
+        
+        client_conn = self.connections[client_fd]
+        
+        # Check if client already has a backend connection
+        if client_conn.paired_fd != -1 and client_conn.paired_fd in self.connections:
+            return client_conn.paired_fd
+        
+        # Create new backend connection
+        try:
+            # Create socket
+            backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backend_socket.setblocking(False)
+            
+            # Start non-blocking connect
+            err = backend_socket.connect_ex((DASH_SERVER_IP, DASH_PORT))
+            if err != 0 and err != errno.EINPROGRESS:
+                backend_socket.close()
+                return None
+            
+            # Get backend fd
+            backend_fd = backend_socket.fileno()
+            
+            # Create connection object
+            self.connections[backend_fd] = Connection(
+                socket=backend_socket,
+                addr=(DASH_SERVER_IP, DASH_PORT),
+                is_backend=True,
+                paired_fd=client_fd
+            )
+            
+            # Link client to backend
+            client_conn.paired_fd = backend_fd
+            
+            # Register with epoll
+            self.epoll.register(backend_fd, select.EPOLLIN)
+            
+            return backend_fd
+            
+        except socket.error as e:
+            logging.error(f"Error creating backend connection: {e}")
+            return None
 
+    # -------------------------- Message Handling Methods -----------------------------------
     def _handle_read(self, fd: int):
         """Handle read events"""
         if fd not in self.connections:
@@ -341,12 +389,13 @@ class DASHProxy:
                 if msg.is_response and client_conn.current_message and client_conn.current_message.is_chunk_request:
                     self._calculate_throughput(client_conn.current_message, msg)
                 
-                # Queue response for client
-                client_conn.output_queue.append(msg)
+                # Write response directly to client output buffer
+                response_bytes = msg.build()
+                client_conn.output_buffer.extend(response_bytes)
                 
                 # Update epoll if needed
-                if not client_conn.output_buffer:
-                    self._prepare_next_message(client_fd)
+                if len(client_conn.output_buffer) == len(response_bytes):  # Buffer was empty before
+                    self.epoll.modify(client_fd, select.EPOLLIN | select.EPOLLOUT)
         else:
             # This is a request from the client to be sent to the backend
             
@@ -365,13 +414,36 @@ class DASHProxy:
             if backend_fd and backend_fd in self.connections:
                 backend_conn = self.connections[backend_fd]
                 
-                # Queue the request for the backend
-                backend_conn.output_queue.append(msg)
+                # Write request directly to backend output buffer
+                request_bytes = msg.build()
+                backend_conn.output_buffer.extend(request_bytes)
                 
                 # Update epoll if needed
-                if not backend_conn.output_buffer:
-                    self._prepare_next_message(backend_fd)
+                if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before
+                    self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
+    def _handle_write(self, fd: int):
+        """Handle write events"""
+        if fd not in self.connections:
+            return
+            
+        conn = self.connections[fd]
+        
+        # Send data in output buffer
+        if conn.output_buffer:
+            try:
+                sent = conn.socket.send(conn.output_buffer)
+                conn.output_buffer = conn.output_buffer[sent:]
+                
+                # If buffer is empty, update epoll to remove write events
+                if not conn.output_buffer:
+                    self.epoll.modify(fd, select.EPOLLIN)
+                        
+            except socket.error as e:
+                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    self._close_connection(fd)
+
+# -------------------------- Adaptive Bitrate Methods -----------------------------------
     def _handle_manifest_request(self, client_fd: int, client_msg: HTTPMessage):
         """Handle manifest request: fetch actual manifest and modify client request"""
         # First, fetch the actual manifest to get bitrates
@@ -386,10 +458,14 @@ class DASHProxy:
         
         if backend_fd and backend_fd in self.connections:
             backend_conn = self.connections[backend_fd]
-            backend_conn.output_queue.append(client_msg)
             
-            if not backend_conn.output_buffer:
-                self._prepare_next_message(backend_fd)
+            # Write modified request directly to backend buffer
+            request_bytes = client_msg.build()
+            backend_conn.output_buffer.extend(request_bytes)
+            
+            # Update epoll if needed
+            if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before
+                self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
     def _fetch_manifest(self, path: str):
         """Fetch manifest.mpd directly and parse available bitrates"""
@@ -526,97 +602,13 @@ class DASHProxy:
         
         logging.info(f"Chunk: {request.chunk_name}, Tput: {throughput:.2f} Kbps, Avg: {self.current_throughput:.2f} Kbps")
 
-    def _get_backend_connection(self, client_fd: int) -> Optional[int]:
-        """Get or create backend connection for a client"""
-        if client_fd not in self.connections:
-            return None
-        
-        client_conn = self.connections[client_fd]
-        
-        # Check if client already has a backend connection
-        if client_conn.paired_fd != -1 and client_conn.paired_fd in self.connections:
-            return client_conn.paired_fd
-        
-        # Create new backend connection
-        try:
-            # Create socket
-            backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            backend_socket.setblocking(False)
-            
-            # Start non-blocking connect
-            err = backend_socket.connect_ex((DASH_SERVER_IP, DASH_PORT))
-            if err != 0 and err != errno.EINPROGRESS:
-                backend_socket.close()
-                return None
-            
-            # Get backend fd
-            backend_fd = backend_socket.fileno()
-            
-            # Create connection object
-            self.connections[backend_fd] = Connection(
-                socket=backend_socket,
-                addr=(DASH_SERVER_IP, DASH_PORT),
-                is_backend=True,
-                paired_fd=client_fd
-            )
-            
-            # Link client to backend
-            client_conn.paired_fd = backend_fd
-            
-            # Register with epoll
-            self.epoll.register(backend_fd, select.EPOLLIN)
-            
-            return backend_fd
-            
-        except socket.error as e:
-            logging.error(f"Error creating backend connection: {e}")
-            return None
-
-    def _prepare_next_message(self, fd: int):
-        """Prepare next message for sending"""
-        if fd not in self.connections:
-            return
-            
-        conn = self.connections[fd]
-        
-        # If buffer is not empty, don't add more data
-        if conn.output_buffer:
-            return
-        
-        # Get next message from queue
-        if conn.output_queue:
-            next_msg = conn.output_queue.popleft()
-            conn.output_buffer.extend(next_msg.build())
-            
-            # Update epoll to include write events
-            self.epoll.modify(fd, select.EPOLLIN | select.EPOLLOUT)
-
-    def _handle_write(self, fd: int):
-        """Handle write events"""
-        if fd not in self.connections:
-            return
-            
-        conn = self.connections[fd]
-        
-        # Send data in output buffer
-        if conn.output_buffer:
-            try:
-                sent = conn.socket.send(conn.output_buffer)
-                conn.output_buffer = conn.output_buffer[sent:]
-                
-                # If buffer is empty, prepare next message or update epoll
-                if not conn.output_buffer:
-                    if conn.output_queue:
-                        self._prepare_next_message(fd)
-                    else:
-                        self.epoll.modify(fd, select.EPOLLIN)
-                        
-            except socket.error as e:
-                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    self._close_connection(fd)
-
+    # -------------------------- Cleanup Methods -----------------------------------
     def _close_connection(self, fd: int):
-        """Close connection and clean up resources"""
+        """
+        Close connection and clean up resources
+        - if client connection, close client socket and corresponding backend socket
+        - if backend connection, close backend socket and clear client's pointer
+        """
         if fd not in self.connections:
             return
             
@@ -666,6 +658,7 @@ class DASHProxy:
         if self.log_file:
             self.log_file.close()
 
+# -------------------------- Driver Code -----------------------------------
 def main():
     parser = argparse.ArgumentParser(description='HTTP Proxy for Adaptive Streaming')
     parser.add_argument('log_file', help='Path to the log file')
