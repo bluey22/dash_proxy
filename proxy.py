@@ -6,7 +6,6 @@ import logging
 import time
 import argparse
 import xml.etree.ElementTree as ET
-from collections import deque
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
@@ -20,6 +19,10 @@ DASH_PORT = 80  # Default HTTP port
 # Manifest file names
 MANIFEST_FILE = "manifest.mpd"
 MANIFEST_NOLIST_FILE = "manifest_nolist.mpd"
+# A nolist manifest is a version of the manifest that doesn't include the full list
+# of adaption sets or available bitrates
+#       - We force the client to request segments at a specific rate, which this proxy can alter
+#       - The DASH server already has a manifest_nolist.mpd available
 
 # Log setup
 logging.basicConfig(
@@ -219,7 +222,7 @@ class DASHProxy:
             self._process_input(fd)
             
         except socket.error as e:
-            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):  # Normal errors in non-blocking mode
                 self._close_connection(fd)
 
     def _process_input(self, fd: int):
@@ -291,15 +294,19 @@ class DASHProxy:
         msg = HTTPMessage()
         
         # Set message type and parse first line
-        if parts[0].startswith('HTTP/'):  # Response
+        if parts[0].startswith('HTTP/'):  
+            # Response
             msg.is_response = True
             msg.version = parts[0]
             msg.status_code = parts[1]
             msg.status_text = ' '.join(parts[2:]) if len(parts) > 2 else ""
-        else:  # Request
+        
+        else:  
+            # Request
             msg.method = parts[0]
             msg.path = parts[1]
-            msg.version = parts[2] if len(parts) > 2 else "HTTP/1.1"
+            # msg.version = parts[2] if len(parts) > 2 else "HTTP/1.1"
+            msg.version = "HTTP/1.1"  # Hardcode Version
             
             # Check if this is a manifest request
             if MANIFEST_FILE in msg.path:
@@ -308,8 +315,14 @@ class DASHProxy:
             # Check if this is a chunk request
             if "Seg" in msg.path:
                 msg.is_chunk_request = True
+
+                # Want total time including modification and proxy processing to better 
+                #   gauge throughput
                 msg.start_time = time.time()
+
+                # Intercept request and change the request URL (adaptive bitrate)
                 self._extract_chunk_info(msg)
+                
         
         # Parse header fields
         for line in lines[1:]:
@@ -333,18 +346,28 @@ class DASHProxy:
         return True
 
     def _extract_chunk_info(self, msg: HTTPMessage):
-        """Extract chunk name and bitrate from request path"""
+        """
+        Extract chunk name and bitrate from request path
+        
+        Called by _process_input() when message is a segment request and 
+        headers are already complete
+
+        Actually modifying bitrate is a call to _modify_chunk_request()
+            - Which is triggered by _handle_complete_message()
+        """
+
+        # Extract the path from the message to modify
         path = msg.path
         
         # Find segment marker
         seg_pos = path.find("Seg")
         if seg_pos >= 0:
             # Find boundaries of chunk name
-            slash_before = path.rfind("/", 0, seg_pos)
+            slash_before = path.rfind("/", 0, seg_pos)  # /videos {/} 500Seg1.m4s
             slash_after = path.find("/", seg_pos)
-            query_pos = path.find("?", seg_pos)
+            query_pos = path.find("?", seg_pos)  # ...1000Seg2.m4s {?} quality=high
             
-            # Determine end position
+            # Determine end position (closest slash or ? or end of url)
             if slash_after >= 0 and query_pos >= 0:
                 end_pos = min(slash_after, query_pos)
             elif slash_after >= 0:
@@ -359,14 +382,14 @@ class DASHProxy:
             
             # Extract chunk name
             chunk_name = path[start_pos:end_pos]
-            msg.chunk_name = chunk_name
+            msg.chunk_name = chunk_name  # e.g., 500Seg1.m4s
             
             # Extract bitrate from chunk name
             try:
                 # Extract numeric part before "Seg"
                 bitrate_part = chunk_name.split("Seg")[0]
                 bitrate = int(''.join(c for c in bitrate_part if c.isdigit()))
-                msg.requested_bitrate = bitrate
+                msg.requested_bitrate = bitrate  # e.g., 500
             except (ValueError, IndexError):
                 pass
 

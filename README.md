@@ -30,13 +30,20 @@ Populate a config.py file with the IP of your DASH server:
 ```bash
 cp config_template.py config.py
 ```
+## How to Run:
+
+## Functionality:
+- Adaptive Bitrate Selection: It intercepts HTTP requests for video chunks and modifies the requested bitrate based on the client’s estimated bandwidth.
+- Manifest File Handling: It replaces requests for manifest.mpd with
+manifest_nolist.mpd in the client’s request to disable the browsers’
+internal bitrate adaptation. Internally, it fetches the actual manifest.mpd
 
 ## Notes:
 ### On Bandwidith Estimation
 The proxy estimates the available bandwidth purely based on how long it takes to download each chunk from the DASH server. The assumption here is that the proxy-to-client connection is fast and reliable (usually on the same local network), so the main bottleneck is the server-to-proxy link. If that link is slow, the proxy adapts by choosing lower-bitrate chunks.
 
 ### On CDNs
-**Note:** 
+**Scope Note:** 
 This is beyond the scope of this project, we're not hunting for URLs -- everything is from a single DASH server. We simply intercept request from the client, removing the browser parsing the manifest on it's own. Our proxy will parse these available bitrates from the <Representation> tags and decide which bitrate to request for each chunk based on throughput. 
 **End Note**
 
