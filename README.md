@@ -16,6 +16,7 @@ Part of our project entails graphing detailed activity, and we'll walk through t
 - Content Delivery Networks (Different rate encodings are stored in different files, replicated in various CDN nodes)
 - Server side Manifest File (provides URLS for different chunks. Meaning, a client can pick up this chunk at this level, manifest directs to specific CDN nodes)
 - Client side bandwidth estimation (when to request, what encoding rate, where to request => **we pull this into our proxy, rather than the browser/client doing it**)
+- Heartbeat / background thread that periodically requests the manifest file from the DASH server in the event that it's dynamic
 
 ## Project Setup
 Set up a virtual environment and install requirements
