@@ -30,28 +30,29 @@ pip install r requirements.txt
 Populate a config.py file with the IP of your DASH server:
 ```bash
 cp config_template.py config.py
+# Now fill in the config.py (DASH_SERVER_IP = "<ENTER_IP_ADDRESS_HERE>")
 ```
 ## How to Run:
 
 ### 1. Start the proxy
 ```bash
-python proxy.py proxy.log 0.5 9999
+python proxy.py proxy.log 0.5 8080
 ```
 This starts the proxy with:
 
 - **Log file**: `proxy.log`
 - **Alpha value**: `0.5` (medium responsiveness)
-- **Port**: `9999`
+- **Port**: `8080`
 
 ### 2. Access the video
 
 1. Open your web browser
-2. Navigate to: [http://localhost:9999/index.html](http://localhost:9999/index.html)
+2. Navigate to: [http://localhost:8080/index.html](http://localhost:8080/index.html)
    - This connects to your proxy, which then forwards requests to the DASH server.
 
 ### 3. Test with bandwidth throttling
 
-First, modify the `bandwidth_throttle_ingress.sh` script to use your actual network interface. Make sure you edited this script to include your INTERFACE. 
+First, modify the `bandwidth_throttle.sh` script to use your actual network interface. Make sure you edited this script to include your INTERFACE. 
 
 Find your interface name with:
 ```bash
