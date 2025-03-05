@@ -65,17 +65,20 @@ INTERFACE="your_interface_name"  # Replace with your actual interface, e.g., eth
 
 Now you can use the script to simulate different network conditions:
 ```bash
+# Ensure correct permissions to start:
+chmod +x bandwidth_throttle.sh
+
 # Limit bandwidth to 500 Kbps (low quality should be selected)
-./bandwidth_throttle_ingress.sh set 500kbit 80
+sudo ./bandwidth_throttle.sh set 500kbit 80
 
 # After watching for a while, increase to 1 Mbps (medium quality)
-./bandwidth_throttle_ingress.sh set 1mbit 80
+sudo ./bandwidth_throttle.sh set 1mbit 80
 
 # Then increase to 2 Mbps (should select higher quality)
-./bandwidth_throttle_ingress.sh set 2mbit 80
+sudo ./bandwidth_throttle.sh set 2mbit 80
 
 # Remove limitations when done
-./bandwidth_throttle_ingress.sh clean
+sudo ./bandwidth_throttle.sh clean
 ```
 
 ### 4. Visualize results

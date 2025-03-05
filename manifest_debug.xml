@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MPD
+    xmlns="urn:mpeg:dash:schema:mpd:2011"
+    profiles="urn:mpeg:dash:profile:full:2011"
+    minBufferTime="PT1S"
+    type="static"
+    mediaPresentationDuration="PT9M56.4S"
+>
+    <Period>
+        <AdaptationSet segmentAlignment="true">
+            <Representation
+                id="10"
+                bandwidth="10000"
+                codecs="avc1.64000c"
+                mimeType="video/mp4"
+                width="320"
+                height="180"
+            >
+                <BaseURL>10/</BaseURL>
+                <SegmentTemplate
+                    initialization="10Seg-init"
+                    media="10Seg$Number$"
+                    timescale="12288"
+                    startNumber="1"
+                >
+                    <SegmentTimeline>
+                        <S t="0" d="49152" r="148"/>
+                        <S d="5632"/>
+                    </SegmentTimeline>
+                </SegmentTemplate>
+            </Representation>
+
+            <Representation
+                id="100"
+                bandwidth="100000"
+                codecs="avc1.64000c"
+                mimeType="video/mp4"
+                width="320"
+                height="180"
+            >
+                <BaseURL>100/</BaseURL>
+                <SegmentTemplate
+                    initialization="100Seg-init"
+                    media="100Seg$Number$"
+                    timescale="12288"
+                    startNumber="1"
+                >
+                    <SegmentTimeline>
+                        <S t="0" d="49152" r="148"/>
+                        <S d="5632"/>
+                    </SegmentTimeline>
+                </SegmentTemplate>
+            </Representation>
+
+            <Representation
+                id="500"
+                bandwidth="500000"
+                codecs="avc1.64000d"
+                mimeType="video/mp4"
+                width="320"
+                height="180"
+            >
+                <BaseURL>500/</BaseURL>
+                <SegmentTemplate
+                    initialization="500Seg-init"
+                    media="500Seg$Number$"
+                    timescale="12288"
+                    startNumber="1"
+                >
+                    <SegmentTimeline>
+                        <S t="0" d="49152" r="148"/>
+                        <S d="5632"/>
+                    </SegmentTimeline>
+                </SegmentTemplate>
+            </Representation>
+
+            <Representation
+                id="1000"
+                bandwidth="1000000"
+                codecs="avc1.640014"
+                mimeType="video/mp4"
+                width="320"
+                height="180"
+            >
+                <BaseURL>1000/</BaseURL>
+                <SegmentTemplate
+                    initialization="1000Seg-init"
+                    media="1000Seg$Number$"
+                    timescale="12288"
+                    startNumber="1"
+                >
+                    <SegmentTimeline>
+                        <S t="0" d="49152" r="148"/>
+                        <S d="5632"/>
+                    </SegmentTimeline>
+                </SegmentTemplate>
+            </Representation>
+        </AdaptationSet>
+    </Period>
+</MPD>
+

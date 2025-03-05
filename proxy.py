@@ -4,15 +4,12 @@ import socket
 import select
 import logging
 import time
+import traceback
 import argparse
 import xml.etree.ElementTree as ET
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from config import DASH_SERVER_IP
-
-# For Manifest Heartbeat only (Not Socket Connections nor Messages)
-import threading
-import time
 
 # Constants
 BUF_SIZE = 16384  # Increased buffer size for video chunk transfers (16KB reads at a time)
@@ -28,9 +25,12 @@ MANIFEST_NOLIST_FILE = "manifest_nolist.mpd"
 #       - We force the client to request segments at a specific rate, which this proxy can alter
 #       - The DASH server already has a manifest_nolist.mpd available
 
+# Known working manifest path
+KNOWN_MANIFEST_PATH = "/vod/manifest.mpd"
+
 # Log setup
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [proxy] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -72,6 +72,14 @@ class HTTPMessage:
         return message
 
 @dataclass
+class ChunkRequestInfo:
+    """Minimal info needed to track a chunk request"""
+    path: str
+    start_time: float
+    chunk_name: str
+    requested_bitrate: int
+
+@dataclass
 class Connection:
     """Connection state manager"""
     socket: socket.socket
@@ -81,8 +89,9 @@ class Connection:
     current_message: Optional[HTTPMessage] = None                   # The current HTTP message being processed (For partial/chunked HTTP requests)
     headers_complete: bool = False      # Flag indicating if the current message has complete headers
     body_received: int = 0              # Flag indicating if the current message has a complete body
-    is_backend: bool = False            # Otherwise is aclient connection
+    is_backend: bool = False            # Otherwise is a client connection
     paired_fd: int = -1  # The paired connection's fd (client<->backend)
+    pending_chunks: List[ChunkRequestInfo] = field(default_factory=list)  # FIFO Queue of tracking Chunk Request Timers
     # keep_alive = True -> HTTP/1.1 "Persistent" Connections for multiple requests
 
 class DASHProxy:
@@ -95,19 +104,12 @@ class DASHProxy:
         self.current_throughput: float = 0
         self.alpha: float = alpha  # EWMA smoothing factor
 
-        # Manifest Heartbeat (woah, profound)
-        self.manifest_refresh_interval: int = 5  # Seconds between manifest refreshes
-        self.manifest_last_path: str = ""  # Store the last path used to fetch manifest
-        self.manifest_lock = threading.Lock()  # For thread-safe access to bitrates
-        
-        # Start manifest refresh thread (move to start?)
-        self.manifest_refresh_active = True
-        self.manifest_refresh_thread = threading.Thread(target=self._refresh_manifest_periodically)
-        self.manifest_refresh_thread.daemon = True
-        self.manifest_refresh_thread.start()
-
         # Proxy Logging
+        self.log_file_path = log_file
         self.log_file = open(log_file, 'w')
+        # Write a header line to the log file
+        self.log_file.write("# timestamp download_time throughput avg_throughput requested_bitrate chunk_name\n")
+        self.log_file.flush()
         
         # Initialize server socket
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -115,7 +117,7 @@ class DASHProxy:
         self.server.setblocking(False)
         
         # Bind and listen
-        self.server.bind(('0.0.0.0', port))
+        self.server.bind(('127.0.0.1', port))
         self.server.listen(CONNECTION_QUEUE_LIMIT)
         
         # Initialize epoll
@@ -123,6 +125,18 @@ class DASHProxy:
         self.epoll.register(self.server.fileno(), select.EPOLLIN)
         
         logging.info(f"DASH Proxy started on port {port} with alpha={alpha}")
+        logging.info(f"Connecting to DASH server at {DASH_SERVER_IP}:{DASH_PORT}")
+        logging.info(f"Writing logs to {log_file}")
+
+        # Test DNS resolution
+        try:
+            server_info = socket.getaddrinfo(DASH_SERVER_IP, DASH_PORT)
+            logging.info(f"DNS resolution successful: {server_info[0][-1]}")
+        except Exception as e:
+            logging.error(f"DNS resolution failed: {e}")
+            
+        # Fetch manifest at startup using the known path
+        self._fetch_manifest(KNOWN_MANIFEST_PATH)
 
     # -------------------------- DASH Proxy Main Loop -----------------------------------
     def start(self):
@@ -149,24 +163,6 @@ class DASHProxy:
             logging.info("Shutting down...")
         finally:
             self.cleanup()
-
-    # -------------------------- DASH Proxy Background Thread ----------------------------
-    def _refresh_manifest_periodically(self):
-        """Background thread that periodically refreshes the manifest"""
-        is_fetching = False  # Flag to track if we're currently fetching
-        
-        while self.manifest_refresh_active:
-            time.sleep(self.manifest_refresh_interval)
-            
-            if self.manifest_last_path and not is_fetching:
-                try:
-                    is_fetching = True
-                    self._fetch_manifest_worker(self.manifest_last_path)
-                    logging.info("Refreshed manifest in background thread")
-                except Exception as e:
-                    logging.error(f"Error in manifest refresh: {e}")
-                finally:
-                    is_fetching = False
 
     # -------------------------- Connection Creation Methods -----------------------------------
     def _accept_connection(self):
@@ -251,6 +247,15 @@ class DASHProxy:
             # Add data to input buffer
             conn.input_buffer.extend(data)
             
+            # For debugging, log client requests
+            if not conn.is_backend:
+                try:
+                    request_text = data.decode('utf-8', errors='ignore')
+                    first_line = request_text.split('\r\n')[0] if '\r\n' in request_text else request_text[:50]
+                    logging.debug(f"Client request: {first_line}")
+                except Exception:
+                    pass
+                
             # Process input buffer
             self._process_input(fd)
             
@@ -329,33 +334,30 @@ class DASHProxy:
         # Set message type and parse first line
         if parts[0].startswith('HTTP/'):  
             # Response
-            msg.is_response = True
+            msg.is_response = True  # Make sure this is set properly
             msg.version = parts[0]
             msg.status_code = parts[1]
             msg.status_text = ' '.join(parts[2:]) if len(parts) > 2 else ""
+            logging.debug(f"Parsed response: {msg.status_code} {msg.status_text}")
         
         else:  
             # Request
+            msg.is_response = False  # Explicitly set for clarity
             msg.method = parts[0]
             msg.path = parts[1]
-            # msg.version = parts[2] if len(parts) > 2 else "HTTP/1.1"
-            msg.version = "HTTP/1.1"  # Hardcode Version
+            msg.version = "HTTP/1.1"
             
             # Check if this is a manifest request
-            if MANIFEST_FILE in msg.path:
+            if MANIFEST_FILE in msg.path or msg.path.endswith(".mpd"):
                 msg.is_manifest_request = True
+                logging.info(f"Detected manifest request: {msg.path}")
             
             # Check if this is a chunk request
             if "Seg" in msg.path:
                 msg.is_chunk_request = True
-
-                # Want total time including modification and proxy processing to better 
-                #   gauge throughput
                 msg.start_time = time.time()
-
-                # Intercept request and change the request URL (adaptive bitrate)
+                logging.info(f"Detected chunk request: {msg.path}")
                 self._extract_chunk_info(msg)
-                
         
         # Parse header fields
         for line in lines[1:]:
@@ -369,6 +371,8 @@ class DASHProxy:
                 if k.lower() == 'content-length':
                     try:
                         msg.content_length = int(v)
+                        if msg.is_response:
+                            logging.debug(f"Response content length: {msg.content_length}")
                     except ValueError:
                         msg.content_length = 0
         
@@ -381,14 +385,7 @@ class DASHProxy:
     def _extract_chunk_info(self, msg: HTTPMessage):
         """
         Extract chunk name and bitrate from request path
-        
-        Called by _process_input() when message is a segment request and 
-        headers are already complete
-
-        Actually modifying bitrate is a call to _modify_chunk_request()
-            - Which is triggered by _handle_complete_message()
         """
-
         # Extract the path from the message to modify
         path = msg.path
         
@@ -396,9 +393,9 @@ class DASHProxy:
         seg_pos = path.find("Seg")
         if seg_pos >= 0:
             # Find boundaries of chunk name
-            slash_before = path.rfind("/", 0, seg_pos)  # /videos {/} 500Seg1.m4s
+            slash_before = path.rfind("/", 0, seg_pos)
             slash_after = path.find("/", seg_pos)
-            query_pos = path.find("?", seg_pos)  # ...1000Seg2.m4s {?} quality=high
+            query_pos = path.find("?", seg_pos)
             
             # Determine end position (closest slash or ? or end of url)
             if slash_after >= 0 and query_pos >= 0:
@@ -423,14 +420,15 @@ class DASHProxy:
                 bitrate_part = chunk_name.split("Seg")[0]
                 bitrate = int(''.join(c for c in bitrate_part if c.isdigit()))
                 msg.requested_bitrate = bitrate  # e.g., 500
-            except (ValueError, IndexError):
-                pass
+                logging.debug(f"Extracted bitrate from chunk: {bitrate}")
+            except (ValueError, IndexError) as e:
+                logging.warning(f"Failed to extract bitrate from chunk name {chunk_name}: {e}")
 
     def _handle_complete_message(self, fd: int):
         """Process a complete HTTP message"""
         if fd not in self.connections:
             return
-            
+                
         conn = self.connections[fd]
         msg = conn.current_message
         
@@ -441,30 +439,64 @@ class DASHProxy:
             if client_fd in self.connections:
                 client_conn = self.connections[client_fd]
                 
-                # NEW: If this is a chunk response, calculate throughput 
-                # (We can get our RTT now that we've full read in the chunk into our message)
-                if msg.is_response and client_conn.current_message and client_conn.current_message.is_chunk_request:
-                    self._calculate_throughput(client_conn.current_message, msg)
+                # Log every response for debugging
+                status = getattr(msg, 'status_code', 'unknown')
+                content_length = getattr(msg, 'content_length', 0)
+                logging.info(f"RESPONSE: status={status}, content_length={content_length}, is_response={getattr(msg, 'is_response', False)}")
                 
-                # Write response directly to client output buffer
+                # Check if we have pending chunk requests to match with this response
+                if hasattr(client_conn, 'pending_chunks') and client_conn.pending_chunks and content_length > 0:
+                    # Get the first chunk info (FIFO approach)
+                    chunk_info = client_conn.pending_chunks.pop(0)
+                    
+                    # Calculate throughput
+                    logging.info(f"Matched response to chunk: {chunk_info.chunk_name}")
+                    self._calculate_throughput_from_info(chunk_info, msg)
+                else:
+                    if hasattr(client_conn, 'pending_chunks'):
+                        logging.info(f"No pending chunks to match with response (have {len(client_conn.pending_chunks)} pending)")
+                    else:
+                        logging.info("No pending chunks list found")
+                
+                # Write response to client
                 response_bytes = msg.build()
                 client_conn.output_buffer.extend(response_bytes)
                 
-                # Update epoll if needed
-                if len(client_conn.output_buffer) == len(response_bytes):  
-                    # Ensure buffer includes write so client_fd can trigger and EPOLLOUT event (which flushes it's Connection.write_buffer)
+                # Update epoll
+                if len(client_conn.output_buffer) == len(response_bytes):
                     self.epoll.modify(client_fd, select.EPOLLIN | select.EPOLLOUT)
         else:
             # This is a request from the client to be sent to the backend
             
-            # If this is a manifest request, fetch the actual manifest first
+            # If this is a manifest request, handle it specially
             if msg.is_manifest_request:
                 self._handle_manifest_request(fd, msg)
                 return
             
-            # For chunk requests, modify the bitrate
+            # For chunk requests, modify the bitrate and track essential info
             if msg.is_chunk_request:
+                # Store original info for tracking
+                original_path = msg.path
+                original_bitrate = msg.requested_bitrate
+
+                # Modify the request
                 self._modify_chunk_request(msg)
+                
+                # Add to pending chunks list
+                if not hasattr(conn, 'pending_chunks'):
+                    conn.pending_chunks = []
+                
+                # Create minimal tracking info
+                chunk_info = ChunkRequestInfo(
+                    path=msg.path,
+                    start_time=time.time(),
+                    chunk_name=msg.chunk_name,
+                    requested_bitrate=msg.requested_bitrate
+                )
+                conn.pending_chunks.append(chunk_info)
+                
+                # Log the tracking
+                logging.info(f"Tracking chunk request: {original_path} ({original_bitrate} Kbps) -> {msg.path} ({msg.requested_bitrate} Kbps)")
             
             # Get or create backend connection
             backend_fd = self._get_backend_connection(fd)
@@ -478,7 +510,6 @@ class DASHProxy:
                 
                 # Update epoll if needed
                 if len(backend_conn.output_buffer) == len(request_bytes):  
-                    # Ensure buffer includes write so backend_fd can trigger and EPOLLOUT event (which flushes it's Connection.write_buffer)
                     self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
     def _handle_write(self, fd: int):
@@ -495,8 +526,6 @@ class DASHProxy:
                 conn.output_buffer = conn.output_buffer[sent:]
                 
                 # If buffer is empty, update epoll to read events
-                # AKA, stop monitoring for write events when we have nothing left to send 
-                #   (level-triggered epoll, trying to avoid big-o = Select)
                 if not conn.output_buffer:
                     self.epoll.modify(fd, select.EPOLLIN)
                         
@@ -507,23 +536,15 @@ class DASHProxy:
     # -------------------------- Adaptive Bitrate Methods -----------------------------------
     def _handle_manifest_request(self, client_fd: int, client_msg: HTTPMessage):
         """
-        Handle manifest request: fetch actual manifest and modify client request
-        
-        Called by _handle_complete_message() when:
-            - Request is from the client to be sent to the backend
-            - The Request is a manifest request (after headers parsed)
+        Handle manifest request: modify client request to use nolist version
         """
-        # Store the manifest path for future refreshes
-        self.manifest_last_path = client_msg.path
-
-        # First, fetch the actual manifest to get bitrates
-        if not self.available_bitrates:
-            # First time fetch - do it synchronously so we have bitrates immediately
-            self._fetch_manifest_worker(client_msg.path)
+        logging.info(f"Handling manifest request: {client_msg.path}")
         
         # Replace manifest.mpd with manifest_nolist.mpd in the request
-        modified_path = client_msg.path.replace(MANIFEST_FILE, MANIFEST_NOLIST_FILE)
-        client_msg.path = modified_path
+        if MANIFEST_FILE in client_msg.path:
+            modified_path = client_msg.path.replace(MANIFEST_FILE, MANIFEST_NOLIST_FILE)
+            client_msg.path = modified_path
+            logging.info(f"Modified manifest request to: {modified_path}")
         
         # Forward the modified request to the backend
         backend_fd = self._get_backend_connection(client_fd)
@@ -536,59 +557,24 @@ class DASHProxy:
             backend_conn.output_buffer.extend(request_bytes)
             
             # Update epoll if needed
-            if len(backend_conn.output_buffer) == len(request_bytes):  # Buffer was empty before (was write before)
+            if len(backend_conn.output_buffer) == len(request_bytes):
                 self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
 
-    # def _fetch_manifest(self, path: str):
+    def _fetch_manifest(self, path: str):
         """
-        BLOCKING VERSION
         Fetch manifest.mpd directly and parse available bitrates
-        
-        Called by _handle_manifest_request() when a client requests the manifest from DASH"""
-        # try:
-        #     # Create a separate socket for this synchronous request
-        #     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        #     sock.connect((DASH_SERVER_IP, DASH_PORT))
-            
-        #     # Replace manifest_nolist.mpd with manifest.mpd if needed
-        #     actual_path = path.replace(MANIFEST_NOLIST_FILE, MANIFEST_FILE)
-            
-        #     # Prepare HTTP request
-        #     request = f"GET {actual_path} HTTP/1.1\r\nHost: {DASH_SERVER_IP}\r\nConnection: close\r\n\r\n"
-            
-        #     # Send request
-        #     sock.sendall(request.encode())
-            
-        #     # Receive response
-        #     response = bytearray()
-        #     while True:
-        #         data = sock.recv(4096)
-        #         if not data:
-        #             break
-        #         response.extend(data)
-            
-        #     sock.close()
-            
-        #     # Extract body from response
-        #     if b'\r\n\r\n' in response:
-        #         body = response.split(b'\r\n\r\n', 1)[1]
-                
-        #         # Parse XML to extract bitrates
-        #         self._parse_manifest(body.decode('utf-8', errors='ignore'))
-                
-        # except Exception as e:
-        #     logging.error(f"Error fetching manifest: {e}")
-
-    def _fetch_manifest_worker(self, path: str):
-        """Worker function that actually fetches the manifest"""
+        """
+        logging.info(f"Fetching manifest from: {path}")
         try:
             # Create a separate socket for this synchronous request
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)  # 5-second timeout to prevent indefinite blocking
+            sock.settimeout(5)  # Add timeout to avoid blocking forever
             sock.connect((DASH_SERVER_IP, DASH_PORT))
             
-            # Replace manifest_nolist.mpd with manifest.mpd if needed
-            actual_path = path.replace(MANIFEST_NOLIST_FILE, MANIFEST_FILE)
+            # Ensure we're requesting the full manifest, not the nolist version
+            actual_path = path
+            if MANIFEST_NOLIST_FILE in actual_path:
+                actual_path = actual_path.replace(MANIFEST_NOLIST_FILE, MANIFEST_FILE)
             
             # Prepare HTTP request
             request = f"GET {actual_path} HTTP/1.1\r\nHost: {DASH_SERVER_IP}\r\nConnection: close\r\n\r\n"
@@ -610,15 +596,30 @@ class DASHProxy:
             
             sock.close()
             
+            # Check for error responses
+            response_str = response[:50].decode('utf-8', errors='ignore')
+            if "404 Not Found" in response_str or "500 Internal" in response_str:
+                logging.error(f"Received error response: {response_str}")
+                return
+            
             # Extract body from response
             if b'\r\n\r\n' in response:
                 body = response.split(b'\r\n\r\n', 1)[1]
+                body_str = body.decode('utf-8', errors='ignore')
+                
+                # Write manifest to a file for inspection
+                with open("manifest_debug.xml", "w") as f:
+                    f.write(body_str)
+                logging.info("Wrote manifest to manifest_debug.xml for inspection")
                 
                 # Parse XML to extract bitrates
-                self._parse_manifest(body.decode('utf-8', errors='ignore'))
+                self._parse_manifest(body_str)
+            else:
+                logging.error("Failed to extract body from manifest response")
                 
         except Exception as e:
             logging.error(f"Error fetching manifest: {e}")
+            logging.error(traceback.format_exc())
             
     def _parse_manifest(self, manifest_content: str):
         """Parse manifest XML to extract available bitrates"""
@@ -633,8 +634,13 @@ class DASHProxy:
             if '}' in root.tag:
                 namespace = '{' + root.tag.split('}')[0].strip('{') + '}'
             
+            logging.info(f"Parsing manifest with namespace: {namespace}")
+            
             # Find all Representation elements
-            for representation in root.findall(f".//{namespace}Representation"):
+            representations = root.findall(f".//{namespace}Representation")
+            logging.info(f"Found {len(representations)} representation elements")
+            
+            for representation in representations:
                 if 'bandwidth' in representation.attrib:
                     try:
                         # Convert from bps to Kbps
@@ -646,91 +652,183 @@ class DASHProxy:
             
             # Sort bitrates
             sorted_bitrates = sorted(bitrates)
+            
+            if not sorted_bitrates:
+                logging.warning("No valid bitrates found in manifest!")
+                # Try alternate methods of finding bitrates
+                for elem in root.findall(f".//*[@bandwidth]"):
+                    try:
+                        bitrate = int(elem.attrib['bandwidth']) // 1000
+                        if bitrate > 0:
+                            sorted_bitrates.append(bitrate)
+                    except (ValueError, KeyError):
+                        pass
+                sorted_bitrates = sorted(sorted_bitrates)
 
-            # Thread-safe update of available_bitrates
-            with self.manifest_lock:
-                self.available_bitrates = sorted_bitrates
+            # Update available_bitrates
+            self.available_bitrates = sorted_bitrates
 
             logging.info(f"Available bitrates: {self.available_bitrates}")
             
         except Exception as e:
             logging.error(f"Error parsing manifest: {e}")
+            logging.error(traceback.format_exc())
 
     def _modify_chunk_request(self, msg: HTTPMessage):
         """Modify chunk request to use appropriate bitrate"""
         if not self.available_bitrates:
-            return  # No bitrates available yet
+            logging.warning("No available bitrates when modifying chunk request!")
+            return
+        
+        logging.info(f"Original chunk request: {msg.path}, bitrate: {msg.requested_bitrate}")
+        
+        # For initialization segments, don't modify the bitrate
+        if "Seg-init" in msg.path:
+            logging.info(f"Skipping modification for initialization segment: {msg.path}")
+            return
         
         # Select best bitrate based on throughput
         new_bitrate = self._select_bitrate()
         
-        # If no change needed, return
+        # If no change needed or it's an initialization segment, return
         if new_bitrate == msg.requested_bitrate:
+            logging.info(f"Keeping same bitrate: {new_bitrate} Kbps")
             return
         
-        # Replace bitrate in chunk name
-        old_chunk = msg.chunk_name
-        if old_chunk and msg.requested_bitrate > 0:
-            new_chunk = old_chunk.replace(str(msg.requested_bitrate), str(new_bitrate))
+        # Parse the path to handle directory structure correctly
+        path_parts = msg.path.split('/')
+        if len(path_parts) >= 3 and path_parts[-2].isdigit():
+            # Handle case where the bitrate is also in the directory path
+            # Example: /vod/500/500Seg1.m4s
+            old_bitrate_str = path_parts[-2]
+            new_bitrate_str = str(new_bitrate)
             
-            # Update path
-            msg.path = msg.path.replace(old_chunk, new_chunk)
+            # Update both directory and filename
+            path_parts[-2] = new_bitrate_str
             
-            # Update chunk info
-            msg.chunk_name = new_chunk
+            # Update filename part
+            filename = path_parts[-1]
+            if msg.requested_bitrate > 0 and str(msg.requested_bitrate) in filename:
+                filename = filename.replace(str(msg.requested_bitrate), str(new_bitrate))
+                path_parts[-1] = filename
+            
+            # Rebuild path
+            old_path = msg.path
+            msg.path = '/'.join(path_parts)
+            
+            # Update chunk info for logging
+            msg.chunk_name = filename
             msg.requested_bitrate = new_bitrate
+            
+            logging.info(f"Modified chunk request (with directory): {old_path} -> {msg.path}")
+        else:
+            # Handle case where bitrate is only in filename
+            old_chunk = msg.chunk_name
+            if old_chunk and msg.requested_bitrate > 0:
+                # Create new chunk name with selected bitrate
+                new_chunk = old_chunk.replace(str(msg.requested_bitrate), str(new_bitrate))
+                
+                # Update path
+                old_path = msg.path
+                msg.path = msg.path.replace(old_chunk, new_chunk)
+                
+                # Update chunk info
+                msg.chunk_name = new_chunk
+                msg.requested_bitrate = new_bitrate
+                
+                logging.info(f"Modified chunk request (filename only): {old_path} -> {msg.path}")
+            else:
+                logging.warning(f"Could not modify chunk request: {msg.path}")
 
     def _select_bitrate(self) -> int:
-        """Select appropriate bitrate based on throughput"""
-        with self.manifest_lock:
-            if not self.available_bitrates:
-                return 100  # Default minimum bitrate
-            
-            # Select highest bitrate where throughput >= 1.5 * bitrate
-            target_throughput = self.current_throughput / 1.5
-            selected = self.available_bitrates[0]  # Start with lowest
-            
-            for bitrate in self.available_bitrates:
-                if bitrate <= target_throughput:
-                    selected = bitrate
-                else:
-                    break
-            
-            return selected
+        """
+        Select appropriate bitrate based on throughput.
+        
+        The proxy selects the highest bitrate for which the current throughput 
+        is at least 1.5 times the bitrate.
+        """
+        if not self.available_bitrates:
+            return 100  # Default minimum bitrate
+        
+        # Use a minimum throughput value for initial requests when no data is available yet
+        throughput = self.current_throughput
+        if throughput <= 0:
+            logging.info(f"Using default starting throughput of {throughput} Kbps")
+        
+        # Get required throughput threshold (1.5x bitrate)
+        threshold = throughput / 1.5
+        
+        logging.info(f"Current throughput: {throughput:.2f} Kbps, threshold: {threshold:.2f} Kbps")
+        
+        # Start with highest bitrate and work downward
+        for bitrate in reversed(self.available_bitrates):
+            if bitrate <= threshold:
+                logging.info(f"Selected bitrate: {bitrate} Kbps (throughput is {(throughput/bitrate):.2f}x bitrate)")
+                return bitrate
+        
+        # If no suitable bitrate found, return the lowest available
+        lowest = self.available_bitrates[0]
+        logging.info(f"No suitable bitrate found, using lowest: {lowest} Kbps")
+        return lowest
 
-    def _calculate_throughput(self, request: HTTPMessage, response: HTTPMessage):
-        """Calculate and update throughput based on chunk download"""
-        # Calculate download time
-        download_time = time.time() - request.start_time
-        
-        if download_time <= 0:
-            return
-        
-        # Get chunk size in bits
-        chunk_size = response.content_length * 8
-        
-        # Calculate throughput in Kbps
-        throughput = chunk_size / 1000 / download_time
-        
-        # Update EWMA throughput
-        if self.current_throughput == 0:
-            self.current_throughput = throughput
-        else:
-            self.current_throughput = self.alpha * throughput + (1 - self.alpha) * self.current_throughput
-        
-        # Log the download
-        log_entry = f"{int(time.time())} {download_time:.2f} {throughput:.2f} {self.current_throughput:.2f} {request.requested_bitrate} {request.chunk_name}\n"
-        self.log_file.write(log_entry)
-        self.log_file.flush()
-        
-        logging.info(f"Chunk: {request.chunk_name}, Tput: {throughput:.2f} Kbps, Avg: {self.current_throughput:.2f} Kbps")
+    # Create a function to calculate throughput from the minimal info
+    def _calculate_throughput_from_info(self, chunk_info: ChunkRequestInfo, response: HTTPMessage):
+        """Calculate throughput using the minimal chunk info and response"""
+        try:
+            # Calculate download time
+            end_time = time.time()
+            download_time = end_time - chunk_info.start_time
+            
+            # Safety check on download time
+            if download_time <= 0:
+                logging.warning(f"Download time is zero or negative: {download_time}s, skipping throughput calculation")
+                return
+            
+            # Get chunk size in bits
+            if not hasattr(response, 'content_length') or response.content_length <= 0:
+                logging.error(f"Invalid content_length: {getattr(response, 'content_length', 'missing')}")
+                return
+                
+            chunk_size = response.content_length * 8
+            
+            # Calculate throughput in Kbps
+            throughput = chunk_size / 1000 / download_time
+            
+            # Log calculation
+            logging.info(f"THROUGHPUT: size={chunk_size/8/1024:.2f} KB, time={download_time:.4f}s, rate={throughput:.2f} Kbps")
+            
+            # Safety check for unreasonably high or low values
+            if throughput < 1 or throughput > 100000:  # 1 Kbps to 100 Mbps range check
+                logging.warning(f"Throughput calculation outside reasonable range: {throughput:.2f} Kbps")
+                return
+            
+            # Update EWMA throughput
+            if self.current_throughput == 0:
+                self.current_throughput = throughput
+            else:
+                self.current_throughput = self.alpha * throughput + (1 - self.alpha) * self.current_throughput
+            
+            logging.info(f"Updated throughput: current={throughput:.2f} Kbps, average={self.current_throughput:.2f} Kbps")
+            
+            # Log the download
+            try:
+                log_entry = f"{int(end_time)} {download_time:.4f} {throughput:.2f} {self.current_throughput:.2f} {chunk_info.requested_bitrate} {chunk_info.chunk_name}\n"
+                
+                with open(self.log_file_path, 'a') as f:
+                    f.write(log_entry)
+                
+                logging.info(f"Wrote to log file: {log_entry.strip()}")
+            except Exception as e:
+                logging.error(f"Error writing to log file: {e}")
+                
+        except Exception as e:
+            logging.error(f"Error calculating throughput: {e}")
+            logging.error(traceback.format_exc())
 
     # -------------------------- Cleanup Methods -----------------------------------
     def _close_connection(self, fd: int):
         """
         Close connection and clean up resources
-        - if client connection, close client socket and corresponding backend socket
-        - if backend connection, close backend socket and clear client's pointer
         """
         if fd not in self.connections:
             return
@@ -762,15 +860,6 @@ class DASHProxy:
 
     def cleanup(self):
         """Clean up all resources"""
-        # Stop the manifest refresh background thread
-        self.manifest_refresh_active = False
-        if hasattr(self, 'manifest_refresh_thread') and self.manifest_refresh_thread.is_alive():
-            try:
-                self.manifest_refresh_thread.join(timeout=1.0)  # Wait up to 1 second
-                logging.info("Successfully joined manifest refresh thread")
-            except Exception as e:
-                logging.warning(f"Error joining manifest refresh thread: {e}")
-
         # Close all connections
         for fd in list(self.connections.keys()):
             try:
@@ -787,8 +876,13 @@ class DASHProxy:
             pass
         
         # Close log file
-        if self.log_file:
-            self.log_file.close()
+        if hasattr(self, 'log_file') and self.log_file and not self.log_file.closed:
+            try:
+                self.log_file.flush()
+                self.log_file.close()
+                logging.info(f"Closed log file: {self.log_file_path}")
+            except Exception as e:
+                logging.error(f"Error closing log file: {e}")
 
 # -------------------------- Driver Code -----------------------------------
 def main():
