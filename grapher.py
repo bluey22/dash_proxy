@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 def main():
     # Read log data from file "proxy.log"
     try:
+        # CHANGE THIS FILE NAME
         with open("proxy.log", "r") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
@@ -65,6 +66,7 @@ def main():
 
     plt.title("Bitrate Adaptation")
     plt.show()
+    # CHANGE THIS FILE NAME
     plt.savefig("AdaptiveBitrateGraph.png")
 
 if __name__ == '__main__':

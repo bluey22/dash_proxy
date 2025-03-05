@@ -142,6 +142,7 @@ class DASHProxy:
     def start(self):
         """Start the proxy server"""
         try:
+            last_timeout_check = time.time()
             while True:
                 events = self.epoll.poll(timeout=1)
                 for fd, event in events:
@@ -158,11 +159,47 @@ class DASHProxy:
                     if event & (select.EPOLLHUP | select.EPOLLERR):
                         # Connection closed or error
                         self._close_connection(fd)
+                    
+                    # Check for timeouts every second
+                    current_time = time.time()
+                    if current_time - last_timeout_check > 1:
+                        self.handle_timeouts()
+                        last_timeout_check = current_time
                         
         except KeyboardInterrupt:
             logging.info("Shutting down...")
         finally:
             self.cleanup()
+
+    def handle_timeouts(self):
+        """Check for stalled downloads and calculate partial throughput"""
+        current_time = time.time()
+        
+        # Check all connections for stalled downloads
+        for fd, conn in list(self.connections.items()):
+            if conn.is_backend and conn.current_message and conn.current_message.content_length > 0:
+                # If we've received part of the body but no progress in 1 seconds
+                if conn.body_received > 0 and conn.body_received < conn.current_message.content_length:
+                    if hasattr(conn, 'last_progress_time') and (current_time - conn.last_progress_time) > 1:
+                        client_fd = conn.paired_fd
+                        if client_fd in self.connections and hasattr(self.connections[client_fd], 'pending_chunks') and self.connections[client_fd].pending_chunks:
+                            chunk_info = self.connections[client_fd].pending_chunks[0]
+                            
+                            # Calculate partial throughput based on bytes received so far
+                            download_time = current_time - chunk_info.start_time
+                            if download_time > 0:
+                                # Calculate throughput based on partial data
+                                chunk_size_bits = conn.body_received * 8
+                                throughput = chunk_size_bits / 1000 / download_time
+                                
+                                # Update EWMA with this partial measurement
+                                self.current_throughput = self.alpha * throughput + (1 - self.alpha) * self.current_throughput
+                                
+                                logging.warning(f"Partial download: {conn.body_received}/{conn.current_message.content_length} bytes, throughput: {throughput:.2f} Kbps, EWMA: {self.current_throughput:.2f} Kbps")
+                                
+            # Track progress time for each backend connection
+            if conn.is_backend and conn.body_received > 0:
+                conn.last_progress_time = current_time
 
     # -------------------------- Connection Creation Methods -----------------------------------
     def _accept_connection(self):
@@ -292,6 +329,15 @@ class DASHProxy:
                         body_data = conn.input_buffer[:remaining]
                         conn.current_message.body.extend(body_data)
                         conn.body_received += len(body_data)
+                        
+                        # Track incremental progress for large downloads
+                        if conn.is_backend and len(body_data) > 0:
+                            # Check if this is a response for a video chunk
+                            client_fd = conn.paired_fd
+                            if client_fd in self.connections and hasattr(self.connections[client_fd], 'pending_chunks') and self.connections[client_fd].pending_chunks:
+                                # Log progress for large chunks
+                                if conn.current_message.content_length > 100000 and conn.body_received % 50000 < (conn.body_received - len(body_data)) % 50000:
+                                    logging.info(f"Download progress: {conn.body_received}/{conn.current_message.content_length} bytes ({(conn.body_received/conn.current_message.content_length*100):.1f}%)")
                         
                         # Remove processed bytes
                         conn.input_buffer = conn.input_buffer[len(body_data):]
@@ -696,7 +742,7 @@ class DASHProxy:
         logging.info(f"Original chunk request: {msg.path}, bitrate: {msg.requested_bitrate}")
         
         # For initialization segments, don't modify the bitrate
-        if "Seg-init" in msg.path:
+        if "Seg-init" in msg.path or "-init" in msg.path:
             logging.info(f"Skipping modification for initialization segment: {msg.path}")
             return
         
@@ -712,28 +758,22 @@ class DASHProxy:
         path_parts = msg.path.split('/')
         if len(path_parts) >= 3 and path_parts[-2].isdigit():
             # Handle case where the bitrate is also in the directory path
-            # Example: /vod/500/500Seg1.m4s
-            old_bitrate_str = path_parts[-2]
-            new_bitrate_str = str(new_bitrate)
-            
+            # Example: /vod/500/500Seg1.m4s            
             # Update both directory and filename
-            path_parts[-2] = new_bitrate_str
+            path_parts[-2] = str(new_bitrate)
             
             # Update filename part
             filename = path_parts[-1]
-            if msg.requested_bitrate > 0 and str(msg.requested_bitrate) in filename:
+            if str(msg.requested_bitrate) in filename:
                 filename = filename.replace(str(msg.requested_bitrate), str(new_bitrate))
                 path_parts[-1] = filename
             
             # Rebuild path
-            old_path = msg.path
             msg.path = '/'.join(path_parts)
-            
-            # Update chunk info for logging
             msg.chunk_name = filename
             msg.requested_bitrate = new_bitrate
-            
-            logging.info(f"Modified chunk request (with directory): {old_path} -> {msg.path}")
+        
+            logging.info(f"Modified chunk request to: {msg.path} ({new_bitrate} Kbps)")
         else:
             # Handle case where bitrate is only in filename
             old_chunk = msg.chunk_name
@@ -763,26 +803,20 @@ class DASHProxy:
         if not self.available_bitrates:
             return 100  # Default minimum bitrate
         
-        # Use a minimum throughput value for initial requests when no data is available yet
-        throughput = self.current_throughput
-        if throughput <= 0:
-            logging.info(f"Using default starting throughput of {throughput} Kbps")
+        threshold = self.current_throughput / 1.5
+        print(f"Throughput: {self.current_throughput:.1f}, Threshold: {threshold:.1f}")
         
-        # Get required throughput threshold (1.5x bitrate)
-        threshold = throughput / 1.5
+        # Start with lowest bitrate as fallback
+        selected = self.available_bitrates[0]
         
-        logging.info(f"Current throughput: {throughput:.2f} Kbps, threshold: {threshold:.2f} Kbps")
-        
-        # Start with highest bitrate and work downward
-        for bitrate in reversed(self.available_bitrates):
+        # Find highest bitrate below threshold
+        for bitrate in self.available_bitrates:
             if bitrate <= threshold:
-                logging.info(f"Selected bitrate: {bitrate} Kbps (throughput is {(throughput/bitrate):.2f}x bitrate)")
-                return bitrate
-        
-        # If no suitable bitrate found, return the lowest available
-        lowest = self.available_bitrates[0]
-        logging.info(f"No suitable bitrate found, using lowest: {lowest} Kbps")
-        return lowest
+                selected = bitrate
+            else:
+                break
+                
+        return selected
 
     # Create a function to calculate throughput from the minimal info
     def _calculate_throughput_from_info(self, chunk_info: ChunkRequestInfo, response: HTTPMessage):

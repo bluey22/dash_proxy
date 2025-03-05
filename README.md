@@ -34,6 +34,8 @@ cp config_template.py config.py
 ```
 ## How to Run:
 
+The results for the runs with alpha = 0.1, 0.5, 0.6, and 1.0 are in AdaptiveBitrateGraph01, ...05, ...06, ...10 respectively and logs in proxy_alpha_01, ...05, ...06, ...10, as well.
+
 ### 1. Start the proxy
 ```bash
 python proxy.py proxy.log 0.5 8080
@@ -72,13 +74,10 @@ chmod +x bandwidth_throttle.sh
 # Limit bandwidth to 500 Kbps (low quality should be selected)
 sudo ./bandwidth_throttle.sh set 500kbit 80
 
-# After watching for a while, increase to 1 Mbps (medium quality)
-sudo ./bandwidth_throttle.sh set 1mbit 80
-
 # Then increase to 2 Mbps (should select higher quality)
 sudo ./bandwidth_throttle.sh set 2mbit 80
 
-# Remove limitations when done
+# Remove limitations when done (should select highest quality)
 sudo ./bandwidth_throttle.sh clean
 ```
 
