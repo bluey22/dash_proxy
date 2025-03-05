@@ -73,11 +73,12 @@ class HTTPMessage:
 
 @dataclass
 class ChunkRequestInfo:
-    """Minimal info needed to track a chunk request"""
+    """Info needed to track a chunk request"""
     path: str
     start_time: float
     chunk_name: str
     requested_bitrate: int
+    backend_fd: int = -1 
 
 @dataclass
 class Connection:
@@ -90,9 +91,9 @@ class Connection:
     headers_complete: bool = False      # Flag indicating if the current message has complete headers
     body_received: int = 0              # Flag indicating if the current message has a complete body
     is_backend: bool = False            # Otherwise is a client connection
-    paired_fd: int = -1  # The paired connection's fd (client<->backend)
-    pending_chunks: List[ChunkRequestInfo] = field(default_factory=list)  # FIFO Queue of tracking Chunk Request Timers
-    # keep_alive = True -> HTTP/1.1 "Persistent" Connections for multiple requests
+    paired_fd: int = -1  # For backend: the client connection fd
+    backend_connections: List[int] = field(default_factory=list)  # For client: list of backend connections
+    pending_chunks: List[ChunkRequestInfo] = field(default_factory=list)
 
 class DASHProxy:
     def __init__(self, log_file, alpha, port):
@@ -222,17 +223,13 @@ class DASHProxy:
             logging.error(f"Error accepting connection: {e}")
     
     def _get_backend_connection(self, client_fd: int) -> Optional[int]:
-        """Get existing socket or create backend connection for a client"""
+        """Get or create a new backend connection for each request"""
         if client_fd not in self.connections:
             return None
         
         client_conn = self.connections[client_fd]
         
-        # Check if client already has a backend connection
-        if client_conn.paired_fd != -1 and client_conn.paired_fd in self.connections:
-            return client_conn.paired_fd
-        
-        # Create new backend connection
+        # Always create a new backend connection for each request
         try:
             # Create socket
             backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -255,8 +252,11 @@ class DASHProxy:
                 paired_fd=client_fd
             )
             
-            # Link client to backend
-            client_conn.paired_fd = backend_fd
+            # Link client to multiple backends by tracking them in a list
+            if not hasattr(client_conn, 'backend_connections'):
+                client_conn.backend_connections = []
+            
+            client_conn.backend_connections.append(backend_fd)
             
             # Register with epoll
             self.epoll.register(backend_fd, select.EPOLLIN)
@@ -266,7 +266,7 @@ class DASHProxy:
         except socket.error as e:
             logging.error(f"Error creating backend connection: {e}")
             return None
-
+        
     # -------------------------- Message Handling Methods -----------------------------------
     def _handle_read(self, fd: int):
         """Handle read events"""
@@ -479,11 +479,10 @@ class DASHProxy:
                 logging.warning(f"Failed to extract bitrate from chunk name {chunk_name}: {e}")
                 msg.requested_bitrate = self.available_bitrates[0] if self.available_bitrates else 100
 
+        
     def _handle_complete_message(self, fd: int):
         """
         Process a complete HTTP message
-        
-        Called by _handle_read() -> _process_input() 
         """
         if fd not in self.connections:
             return
@@ -501,21 +500,26 @@ class DASHProxy:
                 # Log every response for debugging
                 status = getattr(msg, 'status_code', 'unknown')
                 content_length = getattr(msg, 'content_length', 0)
-                logging.info(f"RESPONSE: status={status}, content_length={content_length}, is_response={getattr(msg, 'is_response', False)}")
+                logging.info(f"RESPONSE: status={status}, content_length={content_length}, from backend fd={fd}")
                 
                 # Check if we have pending chunk requests to match with this response
-                if hasattr(client_conn, 'pending_chunks') and client_conn.pending_chunks and (msg.content_length > 0 or len(msg.body) > 0):
-                    # Get the first chunk info (FIFO approach)
-                    chunk_info = client_conn.pending_chunks.pop(0)
+                # Match by backend_fd to ensure we're tracking the right chunk
+                matched_index = -1
+                if hasattr(client_conn, 'pending_chunks') and client_conn.pending_chunks:
+                    for i, chunk_info in enumerate(client_conn.pending_chunks):
+                        if chunk_info.backend_fd == fd:
+                            matched_index = i
+                            break
+                
+                if matched_index >= 0:
+                    # Get the matched chunk info
+                    chunk_info = client_conn.pending_chunks.pop(matched_index)
                     
                     # Calculate throughput
                     logging.info(f"Matched response to chunk: {chunk_info.chunk_name}")
                     self._calculate_throughput_from_info(chunk_info, msg)
                 else:
-                    if hasattr(client_conn, 'pending_chunks'):
-                        logging.info(f"No pending chunks to match with response (have {len(client_conn.pending_chunks)} pending)")
-                    else:
-                        logging.info("No pending chunks list found")
+                    logging.info(f"No matching chunk found for backend fd={fd}")
                 
                 # Write response to client
                 response_bytes = msg.build()
@@ -524,6 +528,11 @@ class DASHProxy:
                 # Update epoll
                 if len(client_conn.output_buffer) == len(response_bytes):
                     self.epoll.modify(client_fd, select.EPOLLIN | select.EPOLLOUT)
+                    
+                # After sending the response, we can close this backend connection
+                # since we're creating a new one for each request
+                self._close_connection(fd)
+                
         else:
             # This is a request from the client to be sent to the backend
             
@@ -541,23 +550,39 @@ class DASHProxy:
                 # Modify the request
                 self._modify_chunk_request(msg)
                 
-                # Add to pending chunks list
-                if not hasattr(conn, 'pending_chunks'):
-                    conn.pending_chunks = []
+                # Get new backend connection for this request
+                backend_fd = self._get_backend_connection(fd)
                 
-                # Create minimal tracking info
-                chunk_info = ChunkRequestInfo(
-                    path=msg.path,
-                    start_time=time.time(),
-                    chunk_name=msg.chunk_name,
-                    requested_bitrate=msg.requested_bitrate
-                )
-                conn.pending_chunks.append(chunk_info)
-                
-                # Log the tracking
-                logging.info(f"Tracking chunk request: {original_path} ({original_bitrate} Kbps) -> {msg.path} ({msg.requested_bitrate} Kbps)")
+                if backend_fd and backend_fd in self.connections:
+                    backend_conn = self.connections[backend_fd]
+                    
+                    # Create minimal tracking info with backend_fd
+                    chunk_info = ChunkRequestInfo(
+                        path=msg.path,
+                        start_time=time.time(),
+                        chunk_name=msg.chunk_name,
+                        requested_bitrate=msg.requested_bitrate,
+                        backend_fd=backend_fd  # Track which backend connection handles this
+                    )
+                    
+                    if not hasattr(conn, 'pending_chunks'):
+                        conn.pending_chunks = []
+                    
+                    conn.pending_chunks.append(chunk_info)
+                    
+                    # Log the tracking
+                    logging.info(f"Tracking chunk request: {original_path} ({original_bitrate} Kbps) -> {msg.path} ({msg.requested_bitrate} Kbps) on backend fd={backend_fd}")
+                    
+                    # Write request directly to backend output buffer
+                    request_bytes = msg.build()
+                    backend_conn.output_buffer.extend(request_bytes)
+                    
+                    # Update epoll if needed
+                    if len(backend_conn.output_buffer) == len(request_bytes):  
+                        self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
+                    return
             
-            # Get or create backend connection
+            # For other requests, just forward as normal
             backend_fd = self._get_backend_connection(fd)
             
             if backend_fd and backend_fd in self.connections:
@@ -570,7 +595,7 @@ class DASHProxy:
                 # Update epoll if needed
                 if len(backend_conn.output_buffer) == len(request_bytes):  
                     self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
-
+                    
     def _handle_write(self, fd: int):
         """Handle write events"""
         if fd not in self.connections:
@@ -605,7 +630,7 @@ class DASHProxy:
             client_msg.path = modified_path
             logging.info(f"Modified manifest request to: {modified_path}")
         
-        # Forward the modified request to the backend
+        # Create a new backend connection for this manifest request
         backend_fd = self._get_backend_connection(client_fd)
         
         if backend_fd and backend_fd in self.connections:
@@ -618,7 +643,9 @@ class DASHProxy:
             # Update epoll if needed
             if len(backend_conn.output_buffer) == len(request_bytes):
                 self.epoll.modify(backend_fd, select.EPOLLIN | select.EPOLLOUT)
-
+        else:
+            logging.error("Failed to create backend connection for manifest request")
+            
     def _fetch_manifest(self, path: str):
         """
         Fetch manifest.mpd directly and parse available bitrates
@@ -889,22 +916,27 @@ class DASHProxy:
             # Close socket
             conn.socket.close()
             
-            # Close paired connection if it exists
-            paired_fd = conn.paired_fd
-            if paired_fd != -1 and paired_fd in self.connections:
-                paired_conn = self.connections[paired_fd]
-                paired_conn.paired_fd = -1  # Remove the pairing
-                
-                # If this is a client connection closing, close the backend too
-                if not conn.is_backend:
-                    self._close_connection(paired_fd)
+            if conn.is_backend:
+                # This is a backend connection closing
+                paired_fd = conn.paired_fd
+                if paired_fd != -1 and paired_fd in self.connections:
+                    # Remove this backend from client's backend_connections list
+                    client_conn = self.connections[paired_fd]
+                    if hasattr(client_conn, 'backend_connections') and fd in client_conn.backend_connections:
+                        client_conn.backend_connections.remove(fd)
+            else:
+                # This is a client connection - close all associated backends
+                if hasattr(conn, 'backend_connections'):
+                    for backend_fd in list(conn.backend_connections):
+                        if backend_fd in self.connections:
+                            self._close_connection(backend_fd)
             
             # Remove from connections dict
             self.connections.pop(fd)
             
         except Exception as e:
             logging.error(f"Error closing connection: {e}")
-
+            
     def cleanup(self):
         """Clean up all resources"""
         # Close all connections
