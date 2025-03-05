@@ -65,6 +65,7 @@ def main():
 
     plt.title("Bitrate Adaptation")
     plt.show()
+    plt.savefig("AdaptiveBitrateGraph.png")
 
 if __name__ == '__main__':
     main()

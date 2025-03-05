@@ -264,7 +264,11 @@ class DASHProxy:
                 self._close_connection(fd)
 
     def _process_input(self, fd: int):
-        """Process input buffer for HTTP messages"""
+        """
+        Process input buffer for HTTP messages
+        
+        Called by _handle_read()
+        """
         if fd not in self.connections:
             return
             
@@ -308,7 +312,11 @@ class DASHProxy:
                     conn.current_message = None
 
     def _process_headers(self, conn: Connection) -> bool:
-        """Parse HTTP headers from input buffer"""
+        """
+        Parse HTTP headers from input buffer
+        
+        Called by _handle_read() -> _process_input() 
+        """
         # Look for header terminator
         if b'\r\n\r\n' not in conn.input_buffer:
             return False  # Incomplete headers
@@ -423,9 +431,14 @@ class DASHProxy:
                 logging.debug(f"Extracted bitrate from chunk: {bitrate}")
             except (ValueError, IndexError) as e:
                 logging.warning(f"Failed to extract bitrate from chunk name {chunk_name}: {e}")
+                msg.requested_bitrate = self.available_bitrates[0] if self.available_bitrates else 100
 
     def _handle_complete_message(self, fd: int):
-        """Process a complete HTTP message"""
+        """
+        Process a complete HTTP message
+        
+        Called by _handle_read() -> _process_input() 
+        """
         if fd not in self.connections:
             return
                 
@@ -445,7 +458,7 @@ class DASHProxy:
                 logging.info(f"RESPONSE: status={status}, content_length={content_length}, is_response={getattr(msg, 'is_response', False)}")
                 
                 # Check if we have pending chunk requests to match with this response
-                if hasattr(client_conn, 'pending_chunks') and client_conn.pending_chunks and content_length > 0:
+                if hasattr(client_conn, 'pending_chunks') and client_conn.pending_chunks and (msg.content_length > 0 or len(msg.body) > 0):
                     # Get the first chunk info (FIFO approach)
                     chunk_info = client_conn.pending_chunks.pop(0)
                     
@@ -785,13 +798,13 @@ class DASHProxy:
                 return
             
             # Get chunk size in bits
-            if not hasattr(response, 'content_length') or response.content_length <= 0:
-                logging.error(f"Invalid content_length: {getattr(response, 'content_length', 'missing')}")
+            chunk_size_bytes = response.content_length if response.content_length > 0 else len(response.body)
+            if chunk_size_bytes <= 0:
+                logging.error("Chunk size is zero, cannot calculate throughput")
                 return
-                
-            chunk_size = response.content_length * 8
             
             # Calculate throughput in Kbps
+            chunk_size = chunk_size_bytes * 8  # Convert to bits
             throughput = chunk_size / 1000 / download_time
             
             # Log calculation

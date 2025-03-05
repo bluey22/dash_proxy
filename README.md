@@ -88,7 +88,7 @@ Run the `grapher.py` script to visualize the data:
 ```bash
 python grapher.py
 ```
-This will create a graph showing:
+This will create a graph (AdaptiveBitrateGraph.png) showing:
 
 - **Measured bandwidth** (blue line)
 - **EWMA bandwidth estimate** (red dashed line)
