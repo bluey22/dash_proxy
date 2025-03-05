@@ -36,7 +36,9 @@ cp config_template.py config.py
 
 The results for the runs with alpha = 0.1, 0.5, 0.6, and 1.0 are in AdaptiveBitrateGraph01, ...05, ...06, ...10 respectively and logs in proxy_alpha_01, ...05, ...06, ...10, as well.
 
-For example, ![Graph for a = 0.6](AdaptiveBitrateGraph06.png)
+<p align="center">
+    <img alt="Graph of a=0.6" src="https://github.com/bluey22/dash_proxy/blob/main/AdaptiveBitrateGraph06.png" width="700">
+</p>
 
 ### 1. Start the proxy
 ```bash
